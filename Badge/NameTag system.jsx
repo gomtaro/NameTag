@@ -355,7 +355,7 @@ function ZoneCard({title,zone,onChange,showFontSize=true,fsRange=[8,72]}){
 /* ════════════════════════════════════════════════════════════════════════════
    메인 컴포넌트
 ════════════════════════════════════════════════════════════════════════════ */
-export default function BadgePrintSystem() {
+export default function NameTagSystem() {
   const [szIdx,       setSzIdx]       = useState(1);      // -1 = 커스텀
   const [customW,     setCustomW]     = useState("100");  // mm (문자열로 저장 → 입력 중 자유롭게)
   const [customH,     setCustomH]     = useState("150");  // mm
@@ -589,7 +589,7 @@ export default function BadgePrintSystem() {
       {/* 사이드바 */}
       <div style={{width:305,background:C.surface,borderRight:`1px solid ${C.border}`,display:"flex",flexDirection:"column",flexShrink:0}}>
         <div style={{padding:"15px 16px 11px",borderBottom:`1px solid ${C.border}`}}>
-          <div style={{fontSize:9.5,fontWeight:700,letterSpacing:"0.16em",color:C.blue,textTransform:"uppercase"}}>Badge Print System</div>
+          <div style={{fontSize:9.5,fontWeight:700,letterSpacing:"0.16em",color:C.blue,textTransform:"uppercase"}}>NameTag System</div>
           <div style={{fontSize:16,fontWeight:700,color:"#f0f6fc",marginTop:2}}>명찰 출력 시스템</div>
         </div>
         <div style={{display:"flex",borderBottom:`1px solid ${C.border}`}}>
