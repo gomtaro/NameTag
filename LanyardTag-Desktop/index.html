@@ -553,7 +553,9 @@
       const [busyMsg,  setBusyMsg]  = useState("");
       const [prog,     setProg]     = useState({cur:0,total:0});
 
-      const canvasRef = useRef(null);
+      const canvasRef   = useRef(null);
+      const mainAreaRef = useRef(null);
+      const [containerSize, setContainerSize] = useState({w:900, h:800});
       const isCustom = szIdx === -1;
       const sz = isCustom
         ? mkCustomSz(Math.max(30,parseInt(customW)||90), Math.max(40,parseInt(customH)||120))
@@ -583,10 +585,15 @@
         };
       }
 
-      // 캔버스 렌더
+      // 캔버스 렌더 (모든 state 변화에 즉시 반영)
       useLayoutEffect(() => {
         const canvas = canvasRef.current;
         if (!canvas) return;
+        // 실제 캔버스 크기가 계산된 크기와 다르면 재설정
+        if (canvas.width !== canvasW || canvas.height !== canvasH) {
+          canvas.width  = canvasW;
+          canvas.height = canvasH;
+        }
         renderTag(canvas, cfg, previewData);
       });
 
@@ -611,6 +618,18 @@
           }
         }
         loadSystemFonts();
+      }, []);
+
+      // 오른쪽 미리보기 영역 크기 추적
+      useEffect(() => {
+        const el = mainAreaRef.current;
+        if (!el) return;
+        const obs = new ResizeObserver(([entry]) => {
+          const { width, height } = entry.contentRect;
+          setContainerSize({ w: Math.floor(width), h: Math.floor(height) });
+        });
+        obs.observe(el);
+        return () => obs.disconnect();
       }, []);
 
       // 배경 이미지 업로드
@@ -732,6 +751,19 @@
         URL.revokeObjectURL(url);
         setBusy(false); setBusyMsg(""); setProg({cur:0,total:0});
       }
+
+      /* ── 미리보기 캔버스 크기 계산 (컨테이너에 맞게 동적 조절) ─────── */
+      const BOTTOM_BAR_H = 62;
+      const CANVAS_PAD   = 40;
+      const availW = Math.max(200, containerSize.w - CANVAS_PAD);
+      const availH = Math.max(250, containerSize.h - BOTTOM_BAR_H - CANVAS_PAD);
+      const aspect = sz.wMM / sz.hMM;
+      let dispW = Math.min(availW, Math.floor(availH * aspect));
+      let dispH = Math.floor(dispW / aspect);
+      if (dispH > availH) { dispH = availH; dispW = Math.floor(availH * aspect); }
+      // 2× 내부 해상도로 선명하게 렌더
+      const canvasW = dispW * 2;
+      const canvasH = dispH * 2;
 
       /* ── 렌더 ─────────────────────────────────────────────────────── */
       return (
@@ -959,46 +991,54 @@
               </div>
             </div>
 
-            {/* 메인 영역 */}
-            <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:16,background:C.bg,padding:24,overflow:"auto"}}>
-              {/* 명찰 프리뷰 */}
-              <div style={{display:"flex",gap:32,alignItems:"flex-start",flexWrap:"wrap",justifyContent:"center"}}>
-                <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
-                  <div style={{fontSize:10,color:C.muted,fontWeight:600}}>명찰 미리보기</div>
+            {/* 메인 미리보기 영역 */}
+            <div ref={mainAreaRef} style={{flex:1,display:"flex",flexDirection:"column",background:C.bg,overflow:"hidden",minWidth:0}}>
+
+              {/* 캔버스 — 가득 채우기 */}
+              <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",overflow:"hidden",padding:`${CANVAS_PAD/2}px ${CANVAS_PAD/2}px 8px`}}>
+                <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6}}>
                   <div style={{
-                    position:"relative",
-                    boxShadow:"0 8px 32px rgba(0,0,0,0.5), 0 2px 8px rgba(0,0,0,0.3)",
-                    borderRadius:4,
-                    overflow:"hidden",
+                    boxShadow:"0 12px 48px rgba(0,0,0,0.55), 0 3px 12px rgba(0,0,0,0.35)",
+                    borderRadius:4, overflow:"hidden", flexShrink:0,
                   }}>
-                    <canvas ref={canvasRef} width={sz.w} height={sz.h}
-                      style={{display:"block",width:sz.w,height:sz.h}}/>
+                    <canvas ref={canvasRef}
+                      width={canvasW} height={canvasH}
+                      style={{display:"block", width:dispW, height:dispH}}/>
                   </div>
-                  <div style={{fontSize:10,color:C.dim}}>
-                    {sz.wMM}×{sz.hMM}mm · {sz.ew}×{sz.eh}px (300dpi)
+                  <div style={{fontSize:10,color:C.dim,letterSpacing:"0.04em"}}>
+                    {sz.wMM}×{sz.hMM}mm &nbsp;·&nbsp; {sz.ew}×{sz.eh}px (300dpi 출력)
                   </div>
-                </div>
-
-                <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:12}}>
-                  <div style={{fontSize:10,color:C.muted,fontWeight:600}}>A4 배치</div>
-                  <A4Preview sz={sz} total={csvData.length}/>
                 </div>
               </div>
 
-              {/* 버튼 */}
-              <div style={{display:"flex",gap:8,flexWrap:"wrap",justifyContent:"center"}}>
-                <button onClick={handlePreview} disabled={busy}
-                  style={{padding:"9px 20px",background:busy?"#444":C.accent,color:"#fff",border:"none",borderRadius:7,fontSize:13,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
-                  {busy ? `${busyMsg} ${prog.total>0?`(${prog.cur}/${prog.total})`:""}` : "👁 미리보기 / 인쇄 준비"}
-                </button>
-                <button onClick={handleSaveZip} disabled={busy}
-                  style={{padding:"9px 18px",background:busy?"#444":C.purple,color:"#fff",border:"none",borderRadius:7,fontSize:13,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
-                  📦 이미지 ZIP
-                </button>
-              </div>
+              {/* 하단 바: A4 정보 + 액션 버튼 */}
+              <div style={{height:BOTTOM_BAR_H,flexShrink:0,borderTop:`1px solid ${C.border}`,background:C.surface,display:"flex",alignItems:"center",padding:"0 18px",gap:14}}>
+                {/* A4 배치 요약 */}
+                <div style={{flex:1,display:"flex",alignItems:"center",gap:10,minWidth:0}}>
+                  {(() => {
+                    const {cols,rows,perPage} = calcLayout(sz);
+                    const pages = csvData.length > 0 ? Math.ceil(csvData.length/perPage) : null;
+                    return (
+                      <div style={{fontSize:11,color:C.muted,lineHeight:1.5}}>
+                        <span style={{color:C.text,fontWeight:700}}>A4 배치: </span>
+                        {cols}열×{rows}행 · <span style={{color:C.blue}}>{perPage}매/페이지</span>
+                        {pages && <> · <span style={{color:C.green,fontWeight:700}}>{csvData.length}명</span> → <span style={{color:C.orange,fontWeight:700}}>{pages}p</span></>}
+                      </div>
+                    );
+                  })()}
+                </div>
 
-              <div style={{fontSize:10,color:C.dim,textAlign:"center",lineHeight:2}}>
-                미리보기 → 인쇄 대화상자에서 <strong style={{color:C.text}}>여백: 없음</strong>, <strong style={{color:C.text}}>배율: 100%</strong>, <strong style={{color:C.text}}>배경 그래픽 포함</strong> 선택
+                {/* 버튼 */}
+                <div style={{display:"flex",gap:7,flexShrink:0}}>
+                  <button onClick={handleSaveZip} disabled={busy}
+                    style={{padding:"7px 13px",background:busy?"#333":C.purple,color:"#fff",border:"none",borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
+                    📦 ZIP
+                  </button>
+                  <button onClick={handlePreview} disabled={busy}
+                    style={{padding:"7px 16px",background:busy?"#333":C.accent,color:"#fff",border:"none",borderRadius:6,fontSize:12,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
+                    {busy ? `${busyMsg}${prog.total>0?` (${prog.cur}/${prog.total})`:""}` : "🖨 인쇄 준비"}
+                  </button>
+                </div>
               </div>
             </div>
           </div>
