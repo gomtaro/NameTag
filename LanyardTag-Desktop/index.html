@@ -448,6 +448,57 @@
       );
     }
 
+    /* ── 시스템 폰트 목록 (오프라인 환경 폴백) ─────────────────────── */
+    const FALLBACK_FONTS = [
+      "맑은 고딕", "굴림", "굴림체", "돋움", "돋움체",
+      "바탕", "바탕체", "궁서", "궁서체",
+      "나눔고딕", "나눔고딕Bold", "나눔명조", "나눔바른고딕",
+      "HY견고딕", "HY그래픽", "HY신명조", "HY중고딕",
+      "Malgun Gothic", "Malgun Gothic Semilight",
+      "Arial", "Arial Black", "Calibri", "Cambria",
+      "Segoe UI", "Tahoma", "Times New Roman", "Verdana",
+    ];
+
+    function FontPicker({ value, onChange, systemFonts }) {
+      const [search, setSearch] = useState("");
+      const fonts = systemFonts && systemFonts.length > 0 ? systemFonts : FALLBACK_FONTS;
+      const filtered = search
+        ? fonts.filter(f => f.toLowerCase().includes(search.toLowerCase()))
+        : fonts;
+      return (
+        <div>
+          <input
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="폰트 검색..."
+            style={{...inp, marginBottom:5, fontSize:11}}
+          />
+          <select
+            value={value}
+            onChange={e => { onChange(e.target.value); setSearch(""); }}
+            size={5}
+            style={{...inp, height:"auto", padding:"2px 0", fontSize:11, cursor:"pointer"}}
+          >
+            {filtered.map(f => (
+              <option key={f} value={f} style={{fontFamily:f, padding:"3px 8px"}}>{f}</option>
+            ))}
+            {filtered.length === 0 && search && (
+              <option value={search}>{search} (직접 입력)</option>
+            )}
+          </select>
+          <div style={{marginTop:5,padding:"5px 8px",background:"#0a0e14",border:`1px solid ${C.border}`,borderRadius:4}}>
+            <span style={{fontSize:10,color:C.muted}}>미리보기: </span>
+            <span style={{fontFamily:value, fontSize:14, color:C.text}}>가나다 ABC 123</span>
+          </div>
+          {systemFonts && systemFonts.length > 0 && (
+            <div style={{fontSize:9,color:C.dim,marginTop:3}}>
+              이 PC에 설치된 폰트 {systemFonts.length}개 감지
+            </div>
+          )}
+        </div>
+      );
+    }
+
     /* ══════════════════════════════════════════════════════════════════
        메인 컴포넌트
     ══════════════════════════════════════════════════════════════════ */
@@ -492,6 +543,9 @@
       const [colMap,   setColMap]   = useState({org:-1,position:-1,name:-1,field1:-1,field2:-1});
       const [pidx,     setPidx]     = useState(0);
 
+      // 시스템 폰트
+      const [systemFonts, setSystemFonts] = useState([]);
+
       // UI
       const [tab,      setTab]      = useState("design");
       const [printHtml,setPrintHtml]= useState(null);
@@ -535,6 +589,29 @@
         if (!canvas) return;
         renderTag(canvas, cfg, previewData);
       });
+
+      // 시스템 폰트 로드 (queryLocalFonts API - Electron/Chromium 지원)
+      useEffect(() => {
+        async function loadSystemFonts() {
+          if (!('queryLocalFonts' in window)) return;
+          try {
+            const fonts = await window.queryLocalFonts();
+            const families = [...new Set(fonts.map(f => f.family))].sort((a, b) => {
+              // 한글 폰트 우선 정렬
+              const aKo = /[가-힣]/.test(a);
+              const bKo = /[가-힣]/.test(b);
+              if (aKo && !bKo) return -1;
+              if (!aKo && bKo) return 1;
+              return a.localeCompare(b);
+            });
+            setSystemFonts(families);
+          } catch(e) {
+            // 권한 거부 또는 미지원 → FALLBACK_FONTS 사용
+            console.log('queryLocalFonts:', e.message);
+          }
+        }
+        loadSystemFonts();
+      }, []);
 
       // 배경 이미지 업로드
       async function handleBgUpload(file) {
@@ -797,15 +874,10 @@
                           style={{width:36,height:26,cursor:"pointer",flexShrink:0}}/>
                         <span style={{fontSize:11,color:C.muted,flex:1,textAlign:"right"}}>{textColor}</span>
                       </Row>
-                      <Row label="폰트">
-                        <select value={fontFamily} onChange={e=>setFontFamily(e.target.value)}
-                          style={{...inp,width:"auto",flex:1,padding:"5px 7px"}}>
-                          <option value="Malgun Gothic">맑은 고딕 (Windows)</option>
-                          <option value="Pretendard">Pretendard</option>
-                          <option value="Noto Sans KR">Noto Sans KR</option>
-                          <option value="Arial">Arial</option>
-                        </select>
-                      </Row>
+                      <div style={{marginBottom:7}}>
+                        <div style={{fontSize:11,color:C.muted,marginBottom:5}}>폰트 (이 PC에 설치된 폰트)</div>
+                        <FontPicker value={fontFamily} onChange={setFontFamily} systemFonts={systemFonts}/>
+                      </div>
                     </Sec>
 
                     {/* 텍스트 영역 */}

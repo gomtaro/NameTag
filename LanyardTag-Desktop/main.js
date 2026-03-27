@@ -17,6 +17,11 @@ function createWindow() {
     backgroundColor: '#0d1117',
   });
 
+  // 로컬 폰트 API 권한 자동 허용 (방화벽 환경 오프라인 사용)
+  win.webContents.session.setPermissionRequestHandler((webContents, permission, callback) => {
+    callback(permission === 'local-fonts');
+  });
+
   win.loadFile('index.html');
   win.once('ready-to-show', () => win.show());
 
