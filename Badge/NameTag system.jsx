@@ -266,7 +266,29 @@ const baseInp={background:"#0d1117",border:"1px solid #30363d",borderRadius:4,co
 function Sec({title,children,accent}){return(<div style={{marginBottom:16}}><div style={{fontSize:9.5,fontWeight:700,color:accent||C.muted,textTransform:"uppercase",letterSpacing:"0.13em",marginBottom:7,paddingBottom:5,borderBottom:`1px solid ${C.border}`}}>{title}</div>{children}</div>);}
 function Row({label,children}){return(<div style={{display:"flex",alignItems:"center",gap:6,marginBottom:7}}>{label&&<span style={{fontSize:11,color:C.muted,flexShrink:0,width:60}}>{label}</span>}<div style={{flex:1,display:"flex",alignItems:"center",gap:5,justifyContent:"flex-end"}}>{children}</div></div>);}
 function Toggle({on,onChange}){return(<div onClick={()=>onChange(!on)} style={{width:32,height:17,background:on?"#238636":C.border2,borderRadius:9,cursor:"pointer",position:"relative",flexShrink:0,transition:"background .2s"}}><div style={{width:13,height:13,background:"#fff",borderRadius:"50%",position:"absolute",top:2,left:on?17:2,transition:"left .2s"}}/></div>);}
-function Slider({min=0,max=100,value,onChange,unit=""}){return(<div style={{display:"flex",alignItems:"center",gap:6,flex:1}}><input type="range" min={min} max={max} value={value} onChange={e=>onChange(+e.target.value)} style={{flex:1}}/><span style={{fontSize:11,color:C.muted,minWidth:28,textAlign:"right"}}>{value}{unit}</span></div>);}
+function Slider({min=0,max=100,step=1,value,onChange,unit=""}){
+  const [editing,setEditing]=React.useState(false);
+  const [raw,setRaw]=React.useState(String(value));
+  React.useEffect(()=>{if(!editing)setRaw(String(value));},[value,editing]);
+  const commit=(v)=>{
+    const n=parseFloat(v);
+    if(!isNaN(n)) onChange(Math.min(max,Math.max(min,n)));
+    setEditing(false);
+  };
+  return(
+    <div style={{display:"flex",alignItems:"center",gap:6,flex:1}}>
+      <input type="range" min={min} max={max} step={step} value={value} onChange={e=>onChange(+e.target.value)} style={{flex:1}}/>
+      <input type="number" min={min} max={max} step={step} value={editing?raw:value}
+        onFocus={()=>{setEditing(true);setRaw(String(value));}}
+        onChange={e=>{setRaw(e.target.value);const n=parseFloat(e.target.value);if(!isNaN(n))onChange(Math.min(max,Math.max(min,n)));}}
+        onBlur={e=>commit(e.target.value)}
+        onKeyDown={e=>e.key==="Enter"&&commit(raw)}
+        style={{width:52,background:"#0d1117",border:"1px solid #30363d",borderRadius:4,color:C.blue,padding:"2px 5px",fontSize:11,textAlign:"center",outline:"none",fontFamily:"monospace"}}
+      />
+      {unit&&<span style={{fontSize:10,color:C.dim,flexShrink:0}}>{unit}</span>}
+    </div>
+  );
+}
 
 function ImgUploadBtn({ id, label, accept, onChange, hasImage, loading }) {
   return (
@@ -304,6 +326,26 @@ function A4Preview({sz,total}){
 }
 
 /* ── 위치 / ZoneCard ──────────────────────────────────────────────────────── */
+function PosNumInput({value,min,max,onChange}){
+  const [editing,setEditing]=React.useState(false);
+  const [raw,setRaw]=React.useState(String(value));
+  React.useEffect(()=>{if(!editing)setRaw(String(value));},[value,editing]);
+  const commit=(v)=>{
+    const n=parseInt(v,10);
+    if(!isNaN(n)) onChange(Math.min(max,Math.max(min,n)));
+    setEditing(false);
+  };
+  return(
+    <input type="number" min={min} max={max} step={1} value={editing?raw:value}
+      onFocus={()=>{setEditing(true);setRaw(String(value));}}
+      onChange={e=>{setRaw(e.target.value);const n=parseInt(e.target.value,10);if(!isNaN(n))onChange(Math.min(max,Math.max(min,n)));}}
+      onBlur={e=>commit(e.target.value)}
+      onKeyDown={e=>e.key==="Enter"&&commit(raw)}
+      style={{width:52,background:"#0d1117",border:`1px solid ${value!==0?"#8b5cf6":"#30363d"}`,borderRadius:4,color:value!==0?C.purple:C.muted,padding:"2px 5px",fontSize:11,textAlign:"center",outline:"none",fontFamily:"monospace",flexShrink:0}}
+    />
+  );
+}
+
 function PosControl({ox,oy,onChange,range=120}){
   const changed=ox!==0||oy!==0;
   return(
@@ -315,14 +357,13 @@ function PosControl({ox,oy,onChange,range=120}){
       <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:7}}>
         <span style={{fontSize:10,color:C.dim,width:24,textAlign:"center"}}>↔</span>
         <input type="range" min={-range} max={range} value={ox} onChange={e=>onChange(+e.target.value,oy)} style={{flex:1}}/>
-        <span style={{fontSize:10,color:ox!==0?C.purple:C.muted,width:32,textAlign:"right",fontFamily:"monospace"}}>{ox>0?"+":""}{ox}</span>
+        <PosNumInput value={ox} min={-range} max={range} onChange={v=>onChange(v,oy)}/>
       </div>
       <div style={{display:"flex",alignItems:"center",gap:6}}>
         <span style={{fontSize:10,color:C.dim,width:24,textAlign:"center"}}>↕</span>
         <input type="range" min={-range} max={range} value={oy} onChange={e=>onChange(ox,+e.target.value)} style={{flex:1}}/>
-        <span style={{fontSize:10,color:oy!==0?C.purple:C.muted,width:32,textAlign:"right",fontFamily:"monospace"}}>{oy>0?"+":""}{oy}</span>
+        <PosNumInput value={oy} min={-range} max={range} onChange={v=>onChange(ox,v)}/>
       </div>
-      {changed&&<div style={{marginTop:6,fontSize:9,color:"#7c5cbf",textAlign:"right",fontFamily:"monospace"}}>({ox>0?"+":""}{ox}, {oy>0?"+":""}{oy})</div>}
     </div>
   );
 }
