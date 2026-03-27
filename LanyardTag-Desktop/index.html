@@ -585,15 +585,10 @@
         };
       }
 
-      // 캔버스 렌더 (모든 state 변화에 즉시 반영)
+      // 캔버스 렌더 (모든 state 변화에 즉시 반영 — 출력과 동일한 해상도 사용)
       useLayoutEffect(() => {
         const canvas = canvasRef.current;
         if (!canvas) return;
-        // 실제 캔버스 크기가 계산된 크기와 다르면 재설정
-        if (canvas.width !== canvasW || canvas.height !== canvasH) {
-          canvas.width  = canvasW;
-          canvas.height = canvasH;
-        }
         renderTag(canvas, cfg, previewData);
       });
 
@@ -752,18 +747,18 @@
         setBusy(false); setBusyMsg(""); setProg({cur:0,total:0});
       }
 
-      /* ── 미리보기 캔버스 크기 계산 (컨테이너에 맞게 동적 조절) ─────── */
+      /* ── 미리보기 CSS 표시 크기 계산 ──────────────────────────────────
+         캔버스 내부 해상도는 출력과 동일한 sz.ew × sz.eh 고정.
+         CSS width/height 만으로 화면에 맞게 축소 → 미리보기 = 출력과 100% 동일.
+      ─────────────────────────────────────────────────────────────── */
       const BOTTOM_BAR_H = 62;
       const CANVAS_PAD   = 40;
       const availW = Math.max(200, containerSize.w - CANVAS_PAD);
       const availH = Math.max(250, containerSize.h - BOTTOM_BAR_H - CANVAS_PAD);
-      const aspect = sz.wMM / sz.hMM;
-      let dispW = Math.min(availW, Math.floor(availH * aspect));
-      let dispH = Math.floor(dispW / aspect);
-      if (dispH > availH) { dispH = availH; dispW = Math.floor(availH * aspect); }
-      // 2× 내부 해상도로 선명하게 렌더
-      const canvasW = dispW * 2;
-      const canvasH = dispH * 2;
+      // sz.ew/sz.eh 비율 그대로 유지하며 가용 영역에 맞춤
+      const scale  = Math.min(availW / sz.ew, availH / sz.eh);
+      const dispW  = Math.floor(sz.ew * scale);
+      const dispH  = Math.floor(sz.eh * scale);
 
       /* ── 렌더 ─────────────────────────────────────────────────────── */
       return (
@@ -1002,8 +997,8 @@
                     borderRadius:4, overflow:"hidden", flexShrink:0,
                   }}>
                     <canvas ref={canvasRef}
-                      width={canvasW} height={canvasH}
-                      style={{display:"block", width:dispW, height:dispH}}/>
+                      width={sz.ew} height={sz.eh}
+                      style={{display:"block", width:dispW, height:dispH, imageRendering:"auto"}}/>
                   </div>
                   <div style={{fontSize:10,color:C.dim,letterSpacing:"0.04em"}}>
                     {sz.wMM}×{sz.hMM}mm &nbsp;·&nbsp; {sz.ew}×{sz.eh}px (300dpi 출력)
