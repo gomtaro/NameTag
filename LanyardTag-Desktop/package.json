@@ -1,0 +1,55 @@
+{
+  "name": "lanyard-tag-system",
+  "version": "1.0.0",
+  "description": "LanyardTag System - 줄명찰 출력 시스템",
+  "main": "main.js",
+  "scripts": {
+    "start": "ELECTRON_RUN_AS_NODE= electron .",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac"
+  },
+  "build": {
+    "appId": "com.lanyard.tag.system",
+    "productName": "줄명찰 시스템",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "index.html",
+      "main.js",
+      "preload.js",
+      "vendor/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "줄명찰 시스템",
+      "installerLanguages": ["ko_KR", "en_US"],
+      "language": "1042"
+    },
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["x64", "arm64"]
+        }
+      ]
+    }
+  },
+  "devDependencies": {
+    "electron": "^32.3.3",
+    "electron-builder": "^25.0.0"
+  }
+}

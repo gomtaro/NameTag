@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>줄명찰 시스템</title>
+  <script src="vendor/react.development.js"></script>
+  <script src="vendor/react-dom.development.js"></script>
+  <script src="vendor/babel.min.js"></script>
+  <script src="vendor/xlsx.full.min.js"></script>
+  <script src="vendor/jszip.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+    body { background: #0d1117; color: #c9d1d9; font-family: 'Malgun Gothic','맑은 고딕','Pretendard',sans-serif; }
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+    input[type=color] { -webkit-appearance: none; border: 1px solid #30363d; border-radius: 4px; overflow: hidden; cursor: pointer; }
+    input[type=color]::-webkit-color-swatch-wrapper { padding: 0; }
+    input[type=color]::-webkit-color-swatch { border: none; }
+    input[type=range] { -webkit-appearance: none; appearance: none; height: 3px; border-radius: 2px; background: #30363d; outline: none; cursor: pointer; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 13px; height: 13px; border-radius: 50%; background: #58a6ff; cursor: pointer; }
+    select, button, input { outline: none; font-family: 'Malgun Gothic','맑은 고딕','Pretendard',sans-serif; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useRef, useLayoutEffect, useEffect, useCallback } = React;
+
+    /* ── 상수 ──────────────────────────────────────────────────────── */
+    const MM = 3.7795275591; // mm → px (96dpi)
+    const PRINT_DPI = 300;
+    const MM_HI = 11.811;   // mm → px (300dpi, for canvas)
+
+    const C = {
+      bg:"#0d1117", surface:"#161b22", border:"#21262d", border2:"#30363d",
+      text:"#c9d1d9", muted:"#8b949e", dim:"#484f58",
+      blue:"#58a6ff", green:"#3fb950", accent:"#1f6feb",
+      purple:"#8b5cf6", orange:"#f0883e", red:"#f85149",
+    };
+
+    /* ── 크기 프리셋 ────────────────────────────────────────────────── */
+    const SIZES = [
+      { label:"소형",   sub:"80×110mm",  wMM:80,  hMM:110 },
+      { label:"표준",   sub:"90×120mm",  wMM:90,  hMM:120 },
+      { label:"중형",   sub:"90×130mm",  wMM:90,  hMM:130 },
+      { label:"대형",   sub:"105×148mm", wMM:105, hMM:148 },
+      { label:"와이드", sub:"100×150mm", wMM:100, hMM:150 },
+    ];
+    SIZES.forEach(s => {
+      const pw = Math.min(260, Math.round(240 * s.wMM / Math.max(s.wMM, s.hMM)));
+      s.w = pw; s.h = Math.round(pw * s.hMM / s.wMM);
+      s.ew = Math.round(s.wMM * MM_HI); s.eh = Math.round(s.hMM * MM_HI);
+    });
+
+    const mkCustomSz = (wMM, hMM) => {
+      const pw = Math.min(260, Math.round(240 * wMM / Math.max(wMM, hMM)));
+      return {
+        label:"직접입력", sub:`${wMM}×${hMM}mm`, wMM, hMM,
+        w: pw, h: Math.round(pw * hMM / wMM),
+        ew: Math.round(wMM * MM_HI), eh: Math.round(hMM * MM_HI),
+      };
+    };
+
+    const A4 = { w:210, h:297, margin:8, gap:3 };
+    const calcLayout = (sz) => {
+      const cols = Math.max(1, Math.floor((A4.w - A4.margin*2 + A4.gap) / (sz.wMM + A4.gap)));
+      const rows = Math.max(1, Math.floor((A4.h - A4.margin*2 + A4.gap) / (sz.hMM + A4.gap)));
+      return { cols, rows, perPage: cols*rows };
+    };
+
+    /* ── 유틸 ──────────────────────────────────────────────────────── */
+    function fileToImage(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = e => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = () => reject(new Error("이미지 변환 실패"));
+          img.src = e.target.result;
+        };
+        reader.onerror = () => reject(new Error("파일 읽기 실패"));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function wrapText(ctx, text, cx, cy, maxW, lh) {
+      if (!text) return;
+      const chars = String(text).split('');
+      let line = "", lines = [];
+      for (const ch of chars) {
+        const t = line + ch;
+        if (ctx.measureText(t).width > maxW && line) { lines.push(line); line = ch; }
+        else line = t;
+      }
+      if (line) lines.push(line);
+      const sy = cy - ((lines.length - 1) * lh) / 2;
+      lines.forEach((l, i) => ctx.fillText(l, cx, sy + i * lh));
+    }
+
+    /* ── 줄명찰 렌더링 ──────────────────────────────────────────────── */
+    function renderTag(canvas, cfg, data = {}) {
+      const ctx = canvas.getContext("2d");
+      const W = canvas.width, H = canvas.height;
+      const s = Math.min(W / cfg.baseW, H / cfg.baseH);
+      ctx.clearRect(0, 0, W, H);
+
+      // 배경
+      if (cfg.bgImg) {
+        const sc = Math.max(W / cfg.bgImg.width, H / cfg.bgImg.height) * cfg.bgScale;
+        const bx = (W - cfg.bgImg.width * sc) / 2 + cfg.bgOffset.x * s;
+        const by = (H - cfg.bgImg.height * sc) / 2 + cfg.bgOffset.y * s;
+        ctx.drawImage(cfg.bgImg, bx, by, cfg.bgImg.width * sc, cfg.bgImg.height * sc);
+      } else {
+        const g = ctx.createLinearGradient(0, 0, 0, H);
+        g.addColorStop(0, "#eef2f8"); g.addColorStop(1, "#dce4f0");
+        ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = "#a0aebf";
+        ctx.font = `${10 * s}px 'Malgun Gothic',sans-serif`;
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText("배경 이미지를 업로드하세요", W / 2, H / 2);
+      }
+
+      // 테두리
+      const bt = cfg.border.thickness * s;
+      if (bt > 0) {
+        ctx.strokeStyle = cfg.border.color;
+        ctx.lineWidth = bt;
+        ctx.strokeRect(bt / 2, bt / 2, W - bt, H - bt);
+      }
+
+      // 줄 구멍 영역
+      const holeAreaH = H * cfg.holeRatio;
+      if (cfg.showHole) {
+        // 구멍 영역 미세 오버레이
+        ctx.fillStyle = "rgba(0,0,0,0.04)";
+        ctx.fillRect(0, 0, W, holeAreaH);
+        // 구멍 원
+        const hr = 6 * s;
+        ctx.save();
+        ctx.fillStyle = "#ffffff";
+        ctx.beginPath(); ctx.arc(W / 2, holeAreaH / 2, hr, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 1.5 * s;
+        ctx.beginPath(); ctx.arc(W / 2, holeAreaH / 2, hr, 0, Math.PI * 2); ctx.stroke();
+        // 구멍 안쪽
+        ctx.fillStyle = "rgba(0,0,0,0.12)";
+        ctx.beginPath(); ctx.arc(W / 2, holeAreaH / 2, hr * 0.55, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+      }
+
+      // 상단 헤더 (행사명)
+      const headerH = H * cfg.headerRatio;
+      const headerTop = holeAreaH;
+      const { zones, textColor, fontFamily, eventName, logoImg, logoScale, logoOffset } = cfg;
+
+      if (zones.top.visible && eventName) {
+        const fs = zones.top.fontSize * s;
+        ctx.fillStyle = textColor;
+        ctx.font = `700 ${fs}px ${fontFamily},'Malgun Gothic','Noto Sans KR',sans-serif`;
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        wrapText(ctx, eventName, W/2 + zones.top.ox*s, headerTop + headerH/2 + zones.top.oy*s, W*0.86, fs*1.35);
+      }
+
+      // 본문 영역 (소속·이름·직위·추가정보)
+      const footerH = H * cfg.footerRatio;
+      const bodyTop = holeAreaH + headerH;
+      const bodyH = H - bodyTop - footerH;
+
+      const bodyDefs = [
+        { key:"org",      val:data.org,      weight:"500" },
+        { key:"name",     val:data.name,     weight:"800" },
+        { key:"position", val:data.position, weight:"400" },
+        { key:"field1",   val:data.field1,   weight:"400" },
+        { key:"field2",   val:data.field2,   weight:"400" },
+      ].filter(d => zones[d.key]?.visible && d.val);
+
+      if (bodyDefs.length) {
+        const sp = bodyH / (bodyDefs.length + 1);
+        bodyDefs.forEach((d, i) => {
+          const zz = zones[d.key];
+          const fs = zz.fontSize * s;
+          ctx.fillStyle = textColor;
+          ctx.font = `${d.weight} ${fs}px ${fontFamily},'Malgun Gothic','Noto Sans KR',sans-serif`;
+          ctx.textAlign = "center"; ctx.textBaseline = "middle";
+          wrapText(ctx, d.val, W/2 + zz.ox*s, bodyTop + sp*(i+1) + zz.oy*s, W*0.88, fs*1.3);
+        });
+      } else if (!data.name && !data.org) {
+        // 샘플 표시
+        const fs = 18 * s;
+        ctx.fillStyle = "rgba(100,130,170,0.4)";
+        ctx.font = `700 ${fs}px ${fontFamily},'Malgun Gothic',sans-serif`;
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText("홍 길 동", W/2, bodyTop + bodyH*0.38);
+        ctx.font = `500 ${fs*0.6}px ${fontFamily},'Malgun Gothic',sans-serif`;
+        ctx.fillText("○○기업 · 대표이사", W/2, bodyTop + bodyH*0.62);
+      }
+
+      // 하단 로고
+      const footerTop = H - footerH;
+      if (zones.logo.visible && logoImg) {
+        const lz = zones.logo;
+        const maxW = W * 0.6, maxH = footerH * 0.72;
+        const sc = Math.min(maxW / logoImg.width, maxH / logoImg.height) * logoScale;
+        const lw = logoImg.width * sc, lh = logoImg.height * sc;
+        ctx.drawImage(logoImg, (W-lw)/2 + lz.ox*s, footerTop + (footerH-lh)/2 + lz.oy*s, lw, lh);
+      }
+    }
+
+    /* ── 인쇄 HTML 생성 ─────────────────────────────────────────────── */
+    async function buildPrintHtml(sz, cfg, dataList, onProgress) {
+      const images = [];
+      for (let i = 0; i < dataList.length; i++) {
+        onProgress && onProgress(i + 1, dataList.length);
+        const c = document.createElement('canvas');
+        c.width = sz.ew; c.height = sz.eh;
+        renderTag(c, { ...cfg, baseW: sz.ew, baseH: sz.eh }, dataList[i]);
+        images.push(c.toDataURL('image/png'));
+        await new Promise(r => setTimeout(r, 0));
+      }
+
+      const { cols, rows, perPage } = calcLayout(sz);
+      const pages = Math.ceil(images.length / perPage);
+
+      let html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>
+  @page{size:A4 portrait;margin:0;}
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{background:#fff;}
+  .page{width:210mm;height:297mm;position:relative;overflow:hidden;page-break-after:always;}
+  .tag{position:absolute;}
+  .tag img{display:block;width:100%;height:100%;}
+</style></head><body>`;
+
+      for (let p = 0; p < pages; p++) {
+        html += `<div class="page">`;
+        for (let i = 0; i < perPage; i++) {
+          const idx = p * perPage + i;
+          if (idx >= images.length) break;
+          const r = Math.floor(i / cols), c2 = i % cols;
+          const x = A4.margin + c2 * (sz.wMM + A4.gap);
+          const y = A4.margin + r * (sz.hMM + A4.gap);
+          html += `<div class="tag" style="left:${x}mm;top:${y}mm;width:${sz.wMM}mm;height:${sz.hMM}mm;">
+  <img src="${images[idx]}"/>
+</div>`;
+        }
+        html += `</div>`;
+      }
+      html += `</body></html>`;
+      return html;
+    }
+
+    /* ── 기본 UI 컴포넌트 ────────────────────────────────────────────── */
+    const inp = { background:"#0d1117", border:`1px solid #30363d`, borderRadius:4, color:"#c9d1d9", padding:"6px 8px", fontSize:12, width:"100%", outline:"none" };
+    function Sec({ title, children, accent }) {
+      return (
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:9.5,fontWeight:700,color:accent||C.muted,textTransform:"uppercase",letterSpacing:"0.13em",marginBottom:7,paddingBottom:5,borderBottom:`1px solid ${C.border}`}}>{title}</div>
+          {children}
+        </div>
+      );
+    }
+    function Row({ label, children }) {
+      return (
+        <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:7}}>
+          {label && <span style={{fontSize:11,color:C.muted,flexShrink:0,width:56}}>{label}</span>}
+          <div style={{flex:1,display:"flex",alignItems:"center",gap:5,justifyContent:"flex-end"}}>{children}</div>
+        </div>
+      );
+    }
+    function Toggle({ on, onChange }) {
+      return (
+        <div onClick={() => onChange(!on)} style={{width:32,height:17,background:on?"#238636":C.border2,borderRadius:9,cursor:"pointer",position:"relative",flexShrink:0,transition:"background .2s"}}>
+          <div style={{width:13,height:13,background:"#fff",borderRadius:"50%",position:"absolute",top:2,left:on?17:2,transition:"left .2s"}}/>
+        </div>
+      );
+    }
+    function Slider({ min=0, max=100, step=1, value, onChange, unit="" }) {
+      const [editing, setEditing] = useState(false);
+      const [raw, setRaw] = useState(String(value));
+      useEffect(() => { if (!editing) setRaw(String(value)); }, [value, editing]);
+      const commit = v => {
+        const n = parseFloat(v);
+        if (!isNaN(n)) onChange(Math.min(max, Math.max(min, n)));
+        setEditing(false);
+      };
+      return (
+        <div style={{display:"flex",alignItems:"center",gap:6,flex:1}}>
+          <input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(+e.target.value)} style={{flex:1}}/>
+          <input type="number" min={min} max={max} step={step} value={editing ? raw : value}
+            onFocus={() => { setEditing(true); setRaw(String(value)); }}
+            onChange={e => { setRaw(e.target.value); const n = parseFloat(e.target.value); if (!isNaN(n)) onChange(Math.min(max, Math.max(min, n))); }}
+            onBlur={e => commit(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && commit(raw)}
+            style={{width:50,background:"#0d1117",border:"1px solid #30363d",borderRadius:4,color:C.blue,padding:"2px 5px",fontSize:11,textAlign:"center",outline:"none",fontFamily:"monospace"}}
+          />
+          {unit && <span style={{fontSize:10,color:C.dim,flexShrink:0}}>{unit}</span>}
+        </div>
+      );
+    }
+    function ImgUploadBtn({ id, label, accept, onChange, hasImage, loading }) {
+      return (
+        <label htmlFor={id} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 11px",background:C.bg,border:`1px dashed ${loading?C.orange:hasImage?"#238636":C.border2}`,borderRadius:6,cursor:"pointer",marginBottom:6,userSelect:"none"}}>
+          <span style={{fontSize:14}}>{loading?"⏳":hasImage?"✓":"↑"}</span>
+          <span style={{fontSize:12,color:loading?C.orange:hasImage?C.green:C.muted}}>
+            {loading?"변환 중...":hasImage?label+" (재업로드)":label}
+          </span>
+          <input id={id} type="file" accept={accept} style={{display:"none"}}
+            onChange={e => { const f = e.target.files[0]; e.target.value = ""; if (f) onChange(f); }}/>
+        </label>
+      );
+    }
+
+    function PosControl({ ox, oy, onChange, range=100 }) {
+      const changed = ox !== 0 || oy !== 0;
+      const numSt = (v) => ({width:50,background:"#0d1117",border:`1px solid ${v!==0?C.purple:"#30363d"}`,borderRadius:4,color:v!==0?C.purple:C.muted,padding:"2px 5px",fontSize:11,textAlign:"center",outline:"none",fontFamily:"monospace",flexShrink:0});
+      return (
+        <div style={{background:"#0a0e14",border:`1px solid ${changed?C.purple:C.border}`,borderRadius:6,padding:"9px 10px"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:7}}>
+            <span style={{fontSize:10,color:changed?C.purple:C.muted,fontWeight:700}}>📍 위치 조정</span>
+            {changed && <button onClick={() => onChange(0,0)} style={{fontSize:9,padding:"2px 7px",background:"#3d1b7a",color:"#c4b5fd",border:"none",borderRadius:10,cursor:"pointer"}}>초기화</button>}
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
+            <span style={{fontSize:10,color:C.dim,width:20,textAlign:"center"}}>↔</span>
+            <input type="range" min={-range} max={range} value={ox} onChange={e => onChange(+e.target.value, oy)} style={{flex:1}}/>
+            <input type="number" min={-range} max={range} value={ox}
+              onChange={e => { const n=parseInt(e.target.value,10); if(!isNaN(n)) onChange(Math.min(range,Math.max(-range,n)),oy); }}
+              style={numSt(ox)}/>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <span style={{fontSize:10,color:C.dim,width:20,textAlign:"center"}}>↕</span>
+            <input type="range" min={-range} max={range} value={oy} onChange={e => onChange(ox, +e.target.value)} style={{flex:1}}/>
+            <input type="number" min={-range} max={range} value={oy}
+              onChange={e => { const n=parseInt(e.target.value,10); if(!isNaN(n)) onChange(ox,Math.min(range,Math.max(-range,n))); }}
+              style={numSt(oy)}/>
+          </div>
+        </div>
+      );
+    }
+
+    function ZoneCard({ title, zone, onChange, fsRange=[8,60] }) {
+      const [open, setOpen] = useState(false);
+      const changed = zone.ox !== 0 || zone.oy !== 0;
+      return (
+        <div style={{background:C.bg,border:`1px solid ${open?C.border2:C.border}`,borderRadius:6,marginBottom:5,overflow:"hidden"}}>
+          <div style={{display:"flex",alignItems:"center",padding:"8px 10px",cursor:"pointer",gap:8}} onClick={() => setOpen(v => !v)}>
+            <span style={{fontSize:11,color:C.text,fontWeight:600,flex:1}}>{title}</span>
+            {changed && <span style={{fontSize:9,padding:"2px 6px",background:"#3d1b7a",color:"#c4b5fd",borderRadius:10}}>조정됨</span>}
+            <Toggle on={zone.visible} onChange={v => onChange({...zone,visible:v})}/>
+            <span style={{fontSize:10,color:C.dim}}>{open?"▲":"▼"}</span>
+          </div>
+          {open && (
+            <div style={{padding:"0 10px 10px",borderTop:`1px solid ${C.border}`}}>
+              <div style={{display:"flex",alignItems:"center",gap:6,marginTop:9,marginBottom:8}}>
+                <span style={{fontSize:11,color:C.muted,width:56,flexShrink:0}}>글자 크기</span>
+                <Slider min={fsRange[0]} max={fsRange[1]} value={zone.fontSize} onChange={v => onChange({...zone,fontSize:v})} unit="px"/>
+              </div>
+              <PosControl ox={zone.ox} oy={zone.oy} onChange={(x,y) => onChange({...zone,ox:x,oy:y})}/>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ── A4 배치 미리보기 ───────────────────────────────────────────── */
+    function A4Preview({ sz, total }) {
+      const { cols, rows, perPage } = calcLayout(sz);
+      const pages = total > 0 ? Math.ceil(total / perPage) : 1;
+      const sW=100, sH=141, mPx=(A4.margin/A4.w)*sW, gPx=(A4.gap/A4.w)*sW;
+      const bW=(sz.wMM/A4.w)*sW, bH=(sz.hMM/A4.h)*sH;
+      const cells = [];
+      for (let r=0;r<rows;r++) for (let c=0;c<cols;c++) cells.push({x:mPx+c*(bW+gPx), y:mPx+r*(bH+gPx), idx:r*cols+c});
+      return (
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6}}>
+          <svg width={sW} height={sH} style={{background:"#fff",borderRadius:2,boxShadow:"0 2px 8px rgba(0,0,0,.4)"}}>
+            {cells.map((c,i) => <rect key={i} x={c.x} y={c.y} width={bW} height={bH} fill={total>0&&c.idx<(total%perPage||perPage)?"#bfdbfe":"#e2e8f0"} stroke="#94a3b8" strokeWidth="0.4" rx="0.5"/>)}
+            {cells.map((c,i) => <text key={`t${i}`} x={c.x+bW/2} y={c.y+bH/2} textAnchor="middle" dominantBaseline="middle" fontSize="4.5" fill="#1e40af" fontFamily="sans-serif" fontWeight="600">{c.idx+1}</text>)}
+          </svg>
+          <div style={{fontSize:10,color:C.muted,textAlign:"center",lineHeight:1.6}}>
+            <span style={{color:C.text,fontWeight:700}}>{cols}열×{rows}행</span> · {perPage}매/페이지
+            {total > 0 && <><br/><span style={{color:C.green,fontWeight:700}}>{total}명</span> → <span style={{color:C.orange,fontWeight:700}}>{pages}p</span></>}
+          </div>
+        </div>
+      );
+    }
+
+    /* ── CSV 샘플 박스 ──────────────────────────────────────────────── */
+    const SAMPLE_CSV = "소속,직위,이름,추가 1,추가 2\n중소기업중앙회,팀장,홍길동,개발팀,서울\n○○기업,대표이사,김철수,영업팀,부산\n△△협회,사무국장,이영희,기획팀,대구";
+    function SampleCsvBox() {
+      const [copied, setCopied] = useState(false);
+      const copy = () => {
+        try { navigator.clipboard.writeText(SAMPLE_CSV).then(() => { setCopied(true); setTimeout(()=>setCopied(false),2000); }); }
+        catch { const ta=document.getElementById("scsv"); if(ta){ta.select();document.execCommand("copy");setCopied(true);setTimeout(()=>setCopied(false),2000);} }
+      };
+      return (
+        <div style={{background:"#0a0e14",border:`1px solid ${C.border2}`,borderRadius:6,padding:10,marginTop:4}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:5}}>
+            <span style={{fontSize:10,color:C.muted,fontWeight:600}}>📋 CSV 샘플 형식</span>
+            <button onClick={copy} style={{fontSize:10,padding:"3px 8px",background:copied?"#238636":C.accent,color:"#fff",border:"none",borderRadius:4,cursor:"pointer"}}>
+              {copied?"✓ 복사됨":"복사"}
+            </button>
+          </div>
+          <textarea id="scsv" readOnly value={SAMPLE_CSV}
+            style={{width:"100%",height:68,background:"#060a0f",border:`1px solid ${C.border}`,borderRadius:4,color:"#7ee787",fontSize:10.5,fontFamily:"'Consolas','Courier New',monospace",padding:"5px 7px",resize:"none",outline:"none"}}
+          />
+        </div>
+      );
+    }
+
+    /* ── 인쇄 미리보기 모달 ────────────────────────────────────────── */
+    function PrintModal({ html, onClose, onPrint, onSavePdf, onSaveZip, busy, msg, prog }) {
+      if (!html) return null;
+      return (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.9)",zIndex:9999,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:10,padding:14}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,width:"100%",maxWidth:860,flexWrap:"wrap"}}>
+            <div style={{flex:1}}>
+              <div style={{fontSize:13,color:C.blue,fontWeight:700}}>📄 A4 줄명찰 출력 미리보기</div>
+              {msg && <div style={{fontSize:10,color:C.orange,marginTop:3}}>{msg}{prog?.total>0&&` (${prog.cur}/${prog.total})`}</div>}
+            </div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap",flexShrink:0}}>
+              <button onClick={onPrint} disabled={busy}
+                style={{padding:"7px 13px",background:busy?"#444":"#1f6feb",color:"#fff",border:"none",borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
+                🖨 인쇄
+              </button>
+              <button onClick={onSavePdf} disabled={busy}
+                style={{padding:"7px 13px",background:busy?"#444":"#238636",color:"#fff",border:"none",borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
+                📥 PDF 저장
+              </button>
+              <button onClick={onSaveZip} disabled={busy}
+                style={{padding:"7px 13px",background:busy?"#444":C.purple,color:"#fff",border:"none",borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
+                📦 이미지 ZIP
+              </button>
+            </div>
+            <button onClick={onClose} disabled={busy}
+              style={{padding:"7px 13px",background:C.border2,color:C.text,border:"none",borderRadius:6,fontSize:12,cursor:"pointer",flexShrink:0,opacity:busy?0.6:1}}>
+              ✕ 닫기
+            </button>
+          </div>
+          <div style={{width:"100%",maxWidth:860,flex:1,minHeight:0,borderRadius:8,overflow:"hidden",background:"#fff",boxShadow:"0 8px 40px rgba(0,0,0,0.6)"}}>
+            <iframe srcDoc={html} style={{width:"100%",height:"100%",minHeight:"60vh",border:"none",display:"block"}} title="줄명찰 미리보기"/>
+          </div>
+          <div style={{fontSize:10,color:C.muted,textAlign:"center",lineHeight:1.8}}>
+            인쇄 설정: <strong style={{color:C.text}}>여백 없음 · 배율 100% · 배경 그래픽 포함</strong>
+          </div>
+        </div>
+      );
+    }
+
+    /* ══════════════════════════════════════════════════════════════════
+       메인 컴포넌트
+    ══════════════════════════════════════════════════════════════════ */
+    function LanyardTagSystem() {
+      // 크기
+      const [szIdx,   setSzIdx]   = useState(1); // 기본: 표준 90×120
+      const [customW, setCustomW] = useState("90");
+      const [customH, setCustomH] = useState("120");
+
+      // 이미지
+      const [bgImg,       setBgImg]       = useState(null);
+      const [logoImg,     setLogoImg]     = useState(null);
+      const [bgLoading,   setBgLoading]   = useState(false);
+      const [logoLoading, setLogoLoading] = useState(false);
+      const [bgOffset,    setBgOffset]    = useState({x:0,y:0});
+      const [bgScale,     setBgScale]     = useState(1.0);
+      const [logoOffset,  setLogoOffset]  = useState({x:0,y:0});
+      const [logoScale,   setLogoScale]   = useState(1.0);
+
+      // 디자인
+      const [border,    setBorder]    = useState({color:"#1e3a8a", thickness:3});
+      const [showHole,  setShowHole]  = useState(true);
+      const [holeRatio, setHoleRatio] = useState(0.09);
+      const [headerRatio, setHeaderRatio] = useState(0.19);
+      const [footerRatio, setFooterRatio] = useState(0.20);
+      const [eventName, setEventName] = useState("2026 중소기업 CEO 포럼");
+      const [textColor, setTextColor] = useState("#1a1a2e");
+      const [fontFamily,setFontFamily]= useState("Malgun Gothic");
+      const [zones,     setZones]     = useState({
+        top:      {visible:true,  fontSize:16, ox:0, oy:0},
+        org:      {visible:true,  fontSize:14, ox:0, oy:0},
+        name:     {visible:true,  fontSize:28, ox:0, oy:0},
+        position: {visible:true,  fontSize:13, ox:0, oy:0},
+        field1:   {visible:false, fontSize:11, ox:0, oy:0},
+        field2:   {visible:false, fontSize:11, ox:0, oy:0},
+        logo:     {visible:true,  fontSize:14, ox:0, oy:0},
+      });
+
+      // 데이터
+      const [csvData,  setCsvData]  = useState([]);
+      const [headers,  setHeaders]  = useState([]);
+      const [colMap,   setColMap]   = useState({org:-1,position:-1,name:-1,field1:-1,field2:-1});
+      const [pidx,     setPidx]     = useState(0);
+
+      // UI
+      const [tab,      setTab]      = useState("design");
+      const [printHtml,setPrintHtml]= useState(null);
+      const [busy,     setBusy]     = useState(false);
+      const [busyMsg,  setBusyMsg]  = useState("");
+      const [prog,     setProg]     = useState({cur:0,total:0});
+
+      const canvasRef = useRef(null);
+      const isCustom = szIdx === -1;
+      const sz = isCustom
+        ? mkCustomSz(Math.max(30,parseInt(customW)||90), Math.max(40,parseInt(customH)||120))
+        : SIZES[szIdx] || SIZES[1];
+
+      // 현재 설정 객체
+      const cfg = {
+        baseW: sz.ew, baseH: sz.eh,
+        bgImg, bgOffset, bgScale,
+        logoImg, logoOffset, logoScale,
+        border, showHole, holeRatio, headerRatio, footerRatio,
+        eventName, textColor, fontFamily, zones,
+      };
+
+      // 현재 미리보기 데이터
+      const previewData = csvData.length > 0 ? mapRow(csvData[pidx] || csvData[0]) : {};
+
+      function mapRow(row) {
+        if (!row) return {};
+        const get = i => (i >= 0 && row[i] != null ? String(row[i]) : "");
+        return {
+          org:      get(colMap.org),
+          position: get(colMap.position),
+          name:     get(colMap.name),
+          field1:   get(colMap.field1),
+          field2:   get(colMap.field2),
+        };
+      }
+
+      // 캔버스 렌더
+      useLayoutEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        renderTag(canvas, cfg, previewData);
+      });
+
+      // 배경 이미지 업로드
+      async function handleBgUpload(file) {
+        setBgLoading(true);
+        try { const img = await fileToImage(file); setBgImg(img); } catch(e) { alert("배경 이미지 오류: " + e.message); }
+        setBgLoading(false);
+      }
+
+      // 로고 업로드
+      async function handleLogoUpload(file) {
+        setLogoLoading(true);
+        try { const img = await fileToImage(file); setLogoImg(img); } catch(e) { alert("로고 이미지 오류: " + e.message); }
+        setLogoLoading(false);
+      }
+
+      // CSV/엑셀 업로드
+      function handleDataUpload(file) {
+        const reader = new FileReader();
+        const isExcel = file.name.match(/\.(xlsx|xls)$/i);
+        reader.onload = e => {
+          try {
+            let rows = [];
+            if (isExcel) {
+              const wb = XLSX.read(new Uint8Array(e.target.result), {type:'array'});
+              const ws = wb.Sheets[wb.SheetNames[0]];
+              rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:""});
+            } else {
+              const text = e.target.result;
+              rows = text.trim().split(/\r?\n/).map(l => l.split(',').map(v => v.replace(/^"|"$/g,'')));
+            }
+            if (rows.length < 2) { alert("데이터가 없습니다. (헤더 포함 2행 이상 필요)"); return; }
+            const hdrs = rows[0].map(String);
+            const data = rows.slice(1).filter(r => r.some(v => String(v).trim()));
+            setHeaders(hdrs);
+            setCsvData(data);
+            setPidx(0);
+
+            // 자동 컬럼 매핑
+            const guess = (keys) => { for(const k of keys){ const i=hdrs.findIndex(h=>h.includes(k)); if(i>=0)return i; } return -1; };
+            setColMap({
+              org:      guess(["소속","기관","회사","조직","단체","org","company"]),
+              position: guess(["직위","직책","직급","역할","pos","title","role"]),
+              name:     guess(["이름","성명","name","성함"]),
+              field1:   guess(["추가 1","추가1","부서","팀","field1","dept"]),
+              field2:   guess(["추가 2","추가2","지역","field2","region"]),
+            });
+            setTab("data");
+          } catch(err) { alert("파일 오류: " + err.message); }
+        };
+        if (isExcel) reader.readAsArrayBuffer(file);
+        else reader.readAsText(file, 'UTF-8');
+      }
+
+      // 미리보기/인쇄 공통 준비
+      async function prepareHtml() {
+        const dataList = csvData.length > 0
+          ? csvData.map(mapRow)
+          : [previewData.name || previewData.org ? previewData : {org:"○○기업",name:"홍길동",position:"대표이사",field1:"",field2:""}];
+        setBusy(true); setBusyMsg("명찰 생성 중..."); setProg({cur:0,total:dataList.length});
+        const html = await buildPrintHtml(sz, cfg, dataList, (cur,total) => setProg({cur,total}));
+        setBusy(false); setBusyMsg(""); setProg({cur:0,total:0});
+        return html;
+      }
+
+      // 미리보기 열기
+      async function handlePreview() {
+        const html = await prepareHtml();
+        setPrintHtml(html);
+      }
+
+      // 인쇄 (Electron IPC 또는 팝업 폴백)
+      async function handlePrint() {
+        if (!printHtml) return;
+        if (window.electronAPI) {
+          setBusy(true); setBusyMsg("인쇄 다이얼로그 열기...");
+          const result = await window.electronAPI.printHtml(printHtml);
+          setBusy(false); setBusyMsg("");
+          if (!result.success && result.reason !== 'cancelled') {
+            alert("인쇄 오류: " + result.reason);
+          }
+        } else {
+          // 브라우저 폴백
+          const pw = window.open('about:blank', '_blank', 'width=900,height=1200');
+          if (!pw) { alert("팝업이 차단되었습니다."); return; }
+          pw.document.open('text/html','replace');
+          pw.document.write(printHtml);
+          pw.document.close();
+          setTimeout(() => { pw.focus(); pw.print(); }, 1000);
+        }
+      }
+
+      // PDF 저장 (인쇄 → PDF로 저장)
+      async function handleSavePdf() {
+        await handlePrint();
+      }
+
+      // 이미지 ZIP 내보내기
+      async function handleSaveZip() {
+        const dataList = csvData.length > 0
+          ? csvData.map(mapRow)
+          : [{org:"○○기업",name:"홍길동",position:"대표이사",field1:"",field2:""}];
+        setBusy(true); setBusyMsg("이미지 생성 중..."); setProg({cur:0,total:dataList.length});
+        const zip = new JSZip();
+        for (let i = 0; i < dataList.length; i++) {
+          setProg({cur:i+1,total:dataList.length});
+          const c = document.createElement('canvas');
+          c.width = sz.ew; c.height = sz.eh;
+          renderTag(c, cfg, dataList[i]);
+          const base64 = c.toDataURL('image/png').split(',')[1];
+          const fname = `tag_${String(i+1).padStart(3,'0')}_${(dataList[i].name||'unnamed').replace(/[\\/:*?"<>|]/g,'')}.png`;
+          zip.file(fname, base64, {base64:true});
+          await new Promise(r => setTimeout(r, 0));
+        }
+        const blob = await zip.generateAsync({type:'blob'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = '줄명찰_이미지.zip'; a.click();
+        URL.revokeObjectURL(url);
+        setBusy(false); setBusyMsg(""); setProg({cur:0,total:0});
+      }
+
+      /* ── 렌더 ─────────────────────────────────────────────────────── */
+      return (
+        <div style={{display:"flex",flexDirection:"column",height:"100vh",overflow:"hidden"}}>
+          {/* 헤더 */}
+          <div style={{height:44,background:C.surface,borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",padding:"0 16px",gap:10,flexShrink:0}}>
+            <span style={{fontSize:9,fontWeight:700,letterSpacing:"0.18em",color:C.blue,textTransform:"uppercase"}}>LanyardTag System</span>
+            <span style={{fontSize:14,fontWeight:700,color:C.text}}>줄명찰 시스템</span>
+            <div style={{flex:1}}/>
+            {csvData.length > 0 && (
+              <span style={{fontSize:11,color:C.green,fontWeight:600}}>
+                ✓ {csvData.length}명 데이터 로드됨
+              </span>
+            )}
+            <button onClick={handlePreview} disabled={busy}
+              style={{padding:"6px 14px",background:busy?"#444":C.accent,color:"#fff",border:"none",borderRadius:6,fontSize:12,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
+              {busy ? busyMsg : "👁 미리보기 / 인쇄"}
+            </button>
+          </div>
+
+          <div style={{display:"flex",flex:1,overflow:"hidden"}}>
+            {/* 사이드바 */}
+            <div style={{width:290,background:C.surface,borderRight:`1px solid ${C.border}`,display:"flex",flexDirection:"column",flexShrink:0,overflow:"hidden"}}>
+              {/* 탭 */}
+              <div style={{display:"flex",borderBottom:`1px solid ${C.border}`,flexShrink:0}}>
+                {["design","data"].map(t => (
+                  <button key={t} onClick={() => setTab(t)}
+                    style={{flex:1,padding:"9px 0",background:tab===t?C.bg:"transparent",border:"none",color:tab===t?C.text:C.muted,fontSize:12,fontWeight:tab===t?700:400,cursor:"pointer",borderBottom:`2px solid ${tab===t?C.blue:"transparent"}`}}>
+                    {t==="design"?"✏ 디자인":"📋 데이터"}
+                  </button>
+                ))}
+              </div>
+
+              <div style={{flex:1,overflowY:"auto",padding:"14px 14px 20px"}}>
+                {tab === "design" && (
+                  <>
+                    {/* 크기 */}
+                    <Sec title="명찰 크기">
+                      <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:8}}>
+                        {SIZES.map((s2, i) => (
+                          <button key={i} onClick={() => setSzIdx(i)}
+                            style={{padding:"5px 9px",background:szIdx===i?C.accent:C.bg,color:szIdx===i?"#fff":C.muted,border:`1px solid ${szIdx===i?C.accent:C.border2}`,borderRadius:5,fontSize:10.5,cursor:"pointer",fontWeight:szIdx===i?700:400}}>
+                            <div>{s2.label}</div>
+                            <div style={{fontSize:9,opacity:0.8}}>{s2.sub}</div>
+                          </button>
+                        ))}
+                        <button onClick={() => setSzIdx(-1)}
+                          style={{padding:"5px 9px",background:isCustom?C.accent:C.bg,color:isCustom?"#fff":C.muted,border:`1px solid ${isCustom?C.accent:C.border2}`,borderRadius:5,fontSize:10.5,cursor:"pointer",fontWeight:isCustom?700:400}}>
+                          <div>직접입력</div>
+                          <div style={{fontSize:9,opacity:0.8}}>Custom</div>
+                        </button>
+                      </div>
+                      {isCustom && (
+                        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                          <input type="number" value={customW} onChange={e=>setCustomW(e.target.value)} min={30} max={300} style={{...inp,width:70,textAlign:"center"}} placeholder="가로"/>
+                          <span style={{color:C.dim,flexShrink:0}}>×</span>
+                          <input type="number" value={customH} onChange={e=>setCustomH(e.target.value)} min={40} max={400} style={{...inp,width:70,textAlign:"center"}} placeholder="세로"/>
+                          <span style={{fontSize:11,color:C.muted,flexShrink:0}}>mm</span>
+                        </div>
+                      )}
+                    </Sec>
+
+                    {/* 배경 이미지 */}
+                    <Sec title="배경 이미지">
+                      <ImgUploadBtn id="bg-upload" label="배경 이미지 업로드" accept="image/*"
+                        onChange={handleBgUpload} hasImage={!!bgImg} loading={bgLoading}/>
+                      {bgImg && <>
+                        <Row label="크기">
+                          <Slider min={0.5} max={3.0} step={0.05} value={bgScale} onChange={setBgScale}/>
+                        </Row>
+                        <PosControl ox={bgOffset.x} oy={bgOffset.y} onChange={(x,y)=>setBgOffset({x,y})}/>
+                        <button onClick={() => { setBgImg(null); setBgOffset({x:0,y:0}); setBgScale(1.0); }}
+                          style={{marginTop:6,width:"100%",padding:"5px",background:"#2d1515",color:C.red,border:`1px solid #4a1515`,borderRadius:5,fontSize:11,cursor:"pointer"}}>
+                          ✕ 배경 제거
+                        </button>
+                      </>}
+                    </Sec>
+
+                    {/* 로고 */}
+                    <Sec title="로고">
+                      <ImgUploadBtn id="logo-upload" label="로고 이미지 업로드" accept="image/*"
+                        onChange={handleLogoUpload} hasImage={!!logoImg} loading={logoLoading}/>
+                      {logoImg && <>
+                        <Row label="크기">
+                          <Slider min={0.3} max={2.5} step={0.05} value={logoScale} onChange={setLogoScale}/>
+                        </Row>
+                        <ZoneCard title="로고 위치" zone={zones.logo} onChange={z=>setZones(v=>({...v,logo:z}))} fsRange={[6,30]}/>
+                        <button onClick={() => { setLogoImg(null); setLogoOffset({x:0,y:0}); setLogoScale(1.0); }}
+                          style={{marginTop:6,width:"100%",padding:"5px",background:"#2d1515",color:C.red,border:`1px solid #4a1515`,borderRadius:5,fontSize:11,cursor:"pointer"}}>
+                          ✕ 로고 제거
+                        </button>
+                      </>}
+                    </Sec>
+
+                    {/* 줄 구멍 */}
+                    <Sec title="줄 구멍 (Lanyard Hole)">
+                      <Row label="표시">
+                        <Toggle on={showHole} onChange={setShowHole}/>
+                      </Row>
+                      {showHole && (
+                        <Row label="높이">
+                          <Slider min={0.04} max={0.20} step={0.01} value={holeRatio} onChange={setHoleRatio} unit="%"/>
+                        </Row>
+                      )}
+                    </Sec>
+
+                    {/* 영역 비율 */}
+                    <Sec title="영역 비율">
+                      <Row label="헤더">
+                        <Slider min={0.05} max={0.40} step={0.01} value={headerRatio} onChange={setHeaderRatio}/>
+                      </Row>
+                      <Row label="푸터">
+                        <Slider min={0.05} max={0.40} step={0.01} value={footerRatio} onChange={setFooterRatio}/>
+                      </Row>
+                    </Sec>
+
+                    {/* 행사명 */}
+                    <Sec title="상단 행사명">
+                      <input value={eventName} onChange={e=>setEventName(e.target.value)}
+                        placeholder="행사명 (빈 칸이면 숨김)"
+                        style={{...inp,marginBottom:6}}/>
+                      <ZoneCard title="행사명 텍스트" zone={zones.top} onChange={z=>setZones(v=>({...v,top:z}))} fsRange={[8,36]}/>
+                    </Sec>
+
+                    {/* 테두리 */}
+                    <Sec title="테두리">
+                      <Row label="색상">
+                        <input type="color" value={border.color} onChange={e=>setBorder(b=>({...b,color:e.target.value}))}
+                          style={{width:36,height:26,cursor:"pointer",flexShrink:0}}/>
+                      </Row>
+                      <Row label="두께">
+                        <Slider min={0} max={15} step={1} value={border.thickness} onChange={v=>setBorder(b=>({...b,thickness:v}))} unit="px"/>
+                      </Row>
+                    </Sec>
+
+                    {/* 텍스트 */}
+                    <Sec title="텍스트 설정">
+                      <Row label="색상">
+                        <input type="color" value={textColor} onChange={e=>setTextColor(e.target.value)}
+                          style={{width:36,height:26,cursor:"pointer",flexShrink:0}}/>
+                        <span style={{fontSize:11,color:C.muted,flex:1,textAlign:"right"}}>{textColor}</span>
+                      </Row>
+                      <Row label="폰트">
+                        <select value={fontFamily} onChange={e=>setFontFamily(e.target.value)}
+                          style={{...inp,width:"auto",flex:1,padding:"5px 7px"}}>
+                          <option value="Malgun Gothic">맑은 고딕 (Windows)</option>
+                          <option value="Pretendard">Pretendard</option>
+                          <option value="Noto Sans KR">Noto Sans KR</option>
+                          <option value="Arial">Arial</option>
+                        </select>
+                      </Row>
+                    </Sec>
+
+                    {/* 텍스트 영역 */}
+                    <Sec title="텍스트 영역">
+                      <ZoneCard title="소속 (org)"      zone={zones.org}      onChange={z=>setZones(v=>({...v,org:z}))}      fsRange={[8,40]}/>
+                      <ZoneCard title="이름 (name)"     zone={zones.name}     onChange={z=>setZones(v=>({...v,name:z}))}     fsRange={[10,60]}/>
+                      <ZoneCard title="직위 (position)" zone={zones.position} onChange={z=>setZones(v=>({...v,position:z}))} fsRange={[8,40]}/>
+                      <ZoneCard title="추가 1 (field1)" zone={zones.field1}   onChange={z=>setZones(v=>({...v,field1:z}))}   fsRange={[6,30]}/>
+                      <ZoneCard title="추가 2 (field2)" zone={zones.field2}   onChange={z=>setZones(v=>({...v,field2:z}))}   fsRange={[6,30]}/>
+                    </Sec>
+                  </>
+                )}
+
+                {tab === "data" && (
+                  <>
+                    <Sec title="데이터 가져오기">
+                      <label style={{display:"flex",alignItems:"center",gap:8,padding:"10px 12px",background:C.bg,border:`1px dashed ${C.border2}`,borderRadius:6,cursor:"pointer",marginBottom:8,userSelect:"none"}}>
+                        <span style={{fontSize:16}}>📂</span>
+                        <div>
+                          <div style={{fontSize:12,color:C.text,fontWeight:600}}>CSV / Excel 업로드</div>
+                          <div style={{fontSize:10,color:C.muted}}>(.csv, .xlsx, .xls)</div>
+                        </div>
+                        <input type="file" accept=".csv,.xlsx,.xls" style={{display:"none"}}
+                          onChange={e => { const f=e.target.files[0]; e.target.value=""; if(f) handleDataUpload(f); }}/>
+                      </label>
+                      <SampleCsvBox/>
+                    </Sec>
+
+                    {csvData.length > 0 && (
+                      <>
+                        <Sec title="컬럼 매핑">
+                          {[
+                            {key:"org",      label:"소속"},
+                            {key:"name",     label:"이름"},
+                            {key:"position", label:"직위"},
+                            {key:"field1",   label:"추가 1"},
+                            {key:"field2",   label:"추가 2"},
+                          ].map(({key,label}) => (
+                            <Row key={key} label={label}>
+                              <select value={colMap[key]} onChange={e=>setColMap(m=>({...m,[key]:+e.target.value}))}
+                                style={{...inp,width:"auto",flex:1,padding:"4px 6px",fontSize:11}}>
+                                <option value={-1}>— 사용 안 함 —</option>
+                                {headers.map((h,i) => <option key={i} value={i}>{h}</option>)}
+                              </select>
+                            </Row>
+                          ))}
+                        </Sec>
+
+                        <Sec title="미리보기 탐색">
+                          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
+                            <button onClick={()=>setPidx(i=>Math.max(0,i-1))} disabled={pidx===0}
+                              style={{padding:"4px 10px",background:C.bg,border:`1px solid ${C.border2}`,borderRadius:4,color:C.text,cursor:"pointer",fontSize:13,opacity:pidx===0?0.4:1}}>←</button>
+                            <span style={{flex:1,textAlign:"center",fontSize:11,color:C.muted}}>
+                              {pidx+1} / {csvData.length}명
+                            </span>
+                            <button onClick={()=>setPidx(i=>Math.min(csvData.length-1,i+1))} disabled={pidx===csvData.length-1}
+                              style={{padding:"4px 10px",background:C.bg,border:`1px solid ${C.border2}`,borderRadius:4,color:C.text,cursor:"pointer",fontSize:13,opacity:pidx===csvData.length-1?0.4:1}}>→</button>
+                          </div>
+                          {/* 현재 데이터 표시 */}
+                          <div style={{background:"#0a0e14",border:`1px solid ${C.border}`,borderRadius:5,padding:"8px 10px",fontSize:11}}>
+                            {Object.entries(mapRow(csvData[pidx])).filter(([,v])=>v).map(([k,v])=>(
+                              <div key={k} style={{display:"flex",gap:6,marginBottom:3}}>
+                                <span style={{color:C.muted,width:40,flexShrink:0}}>{k}</span>
+                                <span style={{color:C.text}}>{v}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </Sec>
+                      </>
+                    )}
+
+                    {csvData.length === 0 && (
+                      <div style={{textAlign:"center",color:C.muted,fontSize:12,padding:"30px 0",lineHeight:2}}>
+                        CSV 또는 Excel 파일을<br/>업로드해주세요
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* 메인 영역 */}
+            <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:16,background:C.bg,padding:24,overflow:"auto"}}>
+              {/* 명찰 프리뷰 */}
+              <div style={{display:"flex",gap:32,alignItems:"flex-start",flexWrap:"wrap",justifyContent:"center"}}>
+                <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
+                  <div style={{fontSize:10,color:C.muted,fontWeight:600}}>명찰 미리보기</div>
+                  <div style={{
+                    position:"relative",
+                    boxShadow:"0 8px 32px rgba(0,0,0,0.5), 0 2px 8px rgba(0,0,0,0.3)",
+                    borderRadius:4,
+                    overflow:"hidden",
+                  }}>
+                    <canvas ref={canvasRef} width={sz.w} height={sz.h}
+                      style={{display:"block",width:sz.w,height:sz.h}}/>
+                  </div>
+                  <div style={{fontSize:10,color:C.dim}}>
+                    {sz.wMM}×{sz.hMM}mm · {sz.ew}×{sz.eh}px (300dpi)
+                  </div>
+                </div>
+
+                <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:12}}>
+                  <div style={{fontSize:10,color:C.muted,fontWeight:600}}>A4 배치</div>
+                  <A4Preview sz={sz} total={csvData.length}/>
+                </div>
+              </div>
+
+              {/* 버튼 */}
+              <div style={{display:"flex",gap:8,flexWrap:"wrap",justifyContent:"center"}}>
+                <button onClick={handlePreview} disabled={busy}
+                  style={{padding:"9px 20px",background:busy?"#444":C.accent,color:"#fff",border:"none",borderRadius:7,fontSize:13,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
+                  {busy ? `${busyMsg} ${prog.total>0?`(${prog.cur}/${prog.total})`:""}` : "👁 미리보기 / 인쇄 준비"}
+                </button>
+                <button onClick={handleSaveZip} disabled={busy}
+                  style={{padding:"9px 18px",background:busy?"#444":C.purple,color:"#fff",border:"none",borderRadius:7,fontSize:13,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
+                  📦 이미지 ZIP
+                </button>
+              </div>
+
+              <div style={{fontSize:10,color:C.dim,textAlign:"center",lineHeight:2}}>
+                미리보기 → 인쇄 대화상자에서 <strong style={{color:C.text}}>여백: 없음</strong>, <strong style={{color:C.text}}>배율: 100%</strong>, <strong style={{color:C.text}}>배경 그래픽 포함</strong> 선택
+              </div>
+            </div>
+          </div>
+
+          {/* 인쇄 모달 */}
+          <PrintModal
+            html={printHtml}
+            onClose={() => { if (!busy) setPrintHtml(null); }}
+            onPrint={handlePrint}
+            onSavePdf={handleSavePdf}
+            onSaveZip={handleSaveZip}
+            busy={busy}
+            msg={busyMsg}
+            prog={prog}
+          />
+        </div>
+      );
+    }
+
+    ReactDOM.render(<LanyardTagSystem />, document.getElementById('root'));
+  </script>
+</body>
+</html>
