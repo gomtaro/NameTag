@@ -1,1060 +1,1277 @@
 <!DOCTYPE html>
 <html lang="ko">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NameTag System - 명찰 출력 시스템</title>
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
-
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        html, body, #root {
-            width: 100%;
-            height: 100%;
-            overflow: hidden;
-        }
-        body {
-            background: #0d1117;
-            color: #c9d1d9;
-        }
-    </style>
-</head>
-<body>
-    <div id="root"></div>
-    
-    <script type="text/babel">
-        const { useState, useRef, useLayoutEffect } = React;
-
-        /* ── 폰트 주입 ───────────────────────────────────────────────────────────── */
-        (function inject() {
-          if (document.querySelector("#bs7-link")) return;
-          const lk = document.createElement("link");
-          lk.id = "bs7-link"; lk.rel = "stylesheet";
-          lk.href = "https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css";
-          document.head.appendChild(lk);          // 나눌고딕 폰트 추가
-          const nk = document.createElement("link");
-          nk.id = "noto-sans-kr"; nk.rel = "stylesheet";
-          nk.href = "https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap";
-          document.head.appendChild(nk);          const st = document.createElement("style");
-          st.id = "bs7-style";
-          st.textContent = `
-            *{box-sizing:border-box;margin:0;padding:0;}
-            body{font-family:'Pretendard',-apple-system,sans-serif!important;background:#0d1117;}
-            ::-webkit-scrollbar{width:5px;}::-webkit-scrollbar-track{background:transparent;}
-            ::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px;}
-            input[type=color]{-webkit-appearance:none;border:1px solid #30363d;border-radius:4px;overflow:hidden;cursor:pointer;}
-            input[type=color]::-webkit-color-swatch-wrapper{padding:0;}input[type=color]::-webkit-color-swatch{border:none;}
-            input[type=range]{-webkit-appearance:none;appearance:none;height:3px;border-radius:2px;background:#30363d;outline:none;cursor:pointer;}
-            input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:#58a6ff;cursor:pointer;}
-            select,button{outline:none;font-family:'Pretendard',-apple-system,sans-serif;}
-          `;
-          document.head.appendChild(st);
-        })();
-
-        /* ── 사이즈 ──────────────────────────────────────────────────────────────── */
-        const MM = 11.811;
-        const DPI_SCALE = 300 / 96; // 300dpi를 96dpi 캔버스에서 표현하기 위한 스케일
-        const mkSz = (label, sub, note, wMM, hMM, pw) => {
-          const ph = Math.round(pw * hMM / wMM);
-          return { label, sub, note, wMM, hMM, w:pw, h:ph, ew:Math.round(wMM*MM), eh:Math.round(hMM*MM) };
-        };
-        const SIZES = [];// 프리셋 사이즈 제거 - 직접입력만 사용
-
-        const mkCustomSz = (wMM, hMM) => {
-          const pw = Math.min(400, Math.round(300 * wMM / Math.max(wMM, hMM)));
-          const ph = Math.round(pw * hMM / wMM);
-          return { label:"직접입력", sub:`${wMM}×${hMM}mm`, note:"사용자 정의", wMM, hMM, w:pw, h:ph, ew:Math.round(wMM*MM), eh:Math.round(hMM*MM) };
-        };
-        const CUSTOM_IDX = -1;
-
-        const A4 = { w:210, h:297, margin:8, gap:4 };
-        const calcLayout = (sz) => {
-          const cols = Math.max(1, Math.floor((A4.w - A4.margin*2 + A4.gap) / (sz.wMM + A4.gap)));
-          const rows = Math.max(1, Math.floor((A4.h - A4.margin*2 + A4.gap) / (sz.hMM + A4.gap)));
-          return { cols, rows, perPage: cols * rows };
-        };
-
-        const C = {
-          bg:"#0d1117", surface:"#161b22", border:"#21262d", border2:"#30363d",
-          text:"#c9d1d9", muted:"#8b949e", dim:"#484f58",
-          blue:"#58a6ff", green:"#3fb950", accent:"#1f6feb", purple:"#8b5cf6", orange:"#f0883e",
-        };
-        const mkZone = (ex={}) => ({ visible:true, fontSize:18, ox:0, oy:0, ...ex });
-
-        function fileToImage(file) {
-          return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = (e) => {
-              const img = new Image();
-              img.onload = () => resolve(img);
-              img.onerror = () => reject(new Error("이미지 변환 실패"));
-              img.src = e.target.result;
-            };
-            reader.onerror = () => reject(new Error("파일 읽기 실패"));
-            reader.readAsDataURL(file);
-          });
-        }
-
-        const SAMPLE_CSV = "소속,직위,이름,추가 1,추가 2\n중소기업중앙회,팀장,홍길동,개발팀,서울\n○○기업,대표이사,김철수,마케팅,부산\n△△협회,사무국장,이영희,기획,대구";
-
-        function SampleCsvBox() {
-          const [copied, setCopied] = useState(false);
-          const copy = () => {
-            navigator.clipboard.writeText(SAMPLE_CSV).then(() => {
-              setCopied(true);
-              setTimeout(() => setCopied(false), 2000);
-            }).catch(() => {
-              const ta = document.getElementById("sample-csv-ta");
-              if (ta) { ta.select(); document.execCommand("copy"); setCopied(true); setTimeout(()=>setCopied(false),2000); }
-            });
-          };
-          return (
-            <div style={{background:"#0a0e14",border:`1px solid ${C.border2}`,borderRadius:6,padding:10,marginTop:4}}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-                <span style={{fontSize:10,color:C.muted,fontWeight:600}}>📋 샘플 형식 (복사 후 메모장에 붙여넣어 .csv로 저장)</span>
-                <button onClick={copy} style={{fontSize:10,padding:"3px 8px",background:copied?"#238636":C.accent,color:"#fff",border:"none",borderRadius:4,cursor:"pointer",flexShrink:0}}>
-                  {copied ? "✓ 복사됨" : "복사"}
-                </button>
-              </div>
-              <textarea id="sample-csv-ta" readOnly value={SAMPLE_CSV}
-                style={{width:"100%",height:72,background:"#060a0f",border:`1px solid ${C.border}`,borderRadius:4,color:"#7ee787",fontSize:11,fontFamily:"monospace",padding:"6px 8px",resize:"none",outline:"none"}}
-              />
-            </div>
-          );
-        }
-
-        function PdfPreviewModal({ preview, onClose, onExportPDF, onExportZip, exporting, expMsg, expProg }) {
-          if (!preview) return null;
-          const iframeRef = useRef(null);
-          const isHtml = preview.type === "html";
-
-          const handlePrint = () => {
-            if (!isHtml || !preview.html) {
-              alert('미리보기 데이터가 없습니다. 👁 미리보기 버튼을 먼저 클릭해주세요.');
-              return;
-            }
-            try {
-              const htmlSize = (preview.html.length / 1024 / 1024).toFixed(2);
-              console.log('인쇄 시작 - HTML 크기:', htmlSize + 'MB');
-              
-              const printWindow = window.open('about:blank', '_blank', 'width=900,height=1200');
-              if (!printWindow) {
-                alert('❌ 팝업이 차단되었습니다.\\n\\n브라우저 팝업 차단을 해제하고 다시 시도해주세요.');
-                return;
-              }
-              
-              // document 작성
-              printWindow.document.open('text/html', 'replace');
-              printWindow.document.write(preview.html);
-              printWindow.document.close();
-              
-              // 모든 이미지와 스타일이 로드될 때까지 기다림
-              let retryCount = 0;
-              const maxRetries = 50; // 최대 10초 대기
-              
-              const tryPrint = () => {
-                retryCount++;
-                if (printWindow.document.readyState === 'complete') {
-                  console.log('문서 로드 완료 (' + retryCount + '회차), 인쇄 실행');
-                  setTimeout(() => {
-                    printWindow.focus();
-                    printWindow.print();
-                  }, 300);
-                } else if (retryCount < maxRetries) {
-                  setTimeout(tryPrint, 200);
-                } else {
-                  console.warn('문서 로드 타임아웃 ('+ maxRetries*200+'ms), 강제 인쇄 시도');
-                  printWindow.focus();
-                  printWindow.print();
-                }
-              };
-              tryPrint();
-              
-            } catch(e) {
-              console.error('인쇄 오류:', e);
-              alert('❌ 인쇄 중 오류:\\n' + (e.message || '알 수 없는 오류'));
-            }
-          };
-
-          return (
-            <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.88)",zIndex:9999,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:12,padding:16}}>
-              <div style={{display:"flex",alignItems:"center",gap:8,width:"100%",maxWidth:860,flexWrap:"wrap"}}>
-                <div style={{flex:1}}>
-                  <div style={{fontSize:12,color:C.blue,fontWeight:700}}>
-                    {isHtml ? "📄 A4 명찰 출력 미리보기" : "🖼 PNG 미리보기"}
-                  </div>
-                  <div style={{fontSize:10,color:C.muted,marginTop:2}}>{preview.name}</div>
-                  {expMsg && <div style={{fontSize:9,color:C.orange,marginTop:4}}>{expMsg}{expProg?.total>0 && ` (${expProg.cur}/${expProg.total})`}</div>}
-                </div>
-                {isHtml && (
-                  <div style={{display:"flex",gap:6,flexShrink:0,flexWrap:"wrap"}}>
-                    <button onClick={onExportPDF} disabled={exporting}
-                      style={{padding:"7px 12px",background:exporting?"#444":"#238636",color:"#fff",border:"none",borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer",opacity:exporting?0.6:1}}>
-                      📥 PDF 다운로드
-                    </button>
-                    <button onClick={onExportZip} disabled={exporting}
-                      style={{padding:"7px 12px",background:exporting?"#444":"#8b5cf6",color:"#fff",border:"none",borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer",opacity:exporting?0.6:1}}>
-                      📦 이미지 ZIP
-                    </button>
-                    <button onClick={handlePrint} disabled={exporting}
-                      style={{padding:"7px 12px",background:exporting?"#444":"#1f6feb",color:"#fff",border:"none",borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer",opacity:exporting?0.6:1}}>
-                      🖨 인쇄
-                    </button>
-                  </div>
-                )}
-                <button onClick={onClose} disabled={exporting}
-                  style={{padding:"7px 14px",background:C.border2,color:C.text,border:"none",borderRadius:6,fontSize:12,cursor:"pointer",flexShrink:0,opacity:exporting?0.6:1}}>
-                  ✕ 닫기
-                </button>
-              </div>
-
-              <div style={{width:"100%",maxWidth:860,flex:1,minHeight:0,borderRadius:8,overflow:"hidden",background:"#fff",boxShadow:"0 8px 40px rgba(0,0,0,0.6)"}}>
-                {isHtml
-                  ? <iframe ref={iframeRef} srcDoc={preview.html}
-                      style={{width:"100%",height:"100%",minHeight:"60vh",border:"none",display:"block"}}
-                      title="명찰 미리보기"/>
-                  : <img src={preview.url} alt="badge"
-                      style={{maxWidth:"100%",maxHeight:"70vh",display:"block",margin:"0 auto",padding:16}}/>
-                }
-              </div>
-
-              {isHtml && (
-                <div style={{fontSize:10,color:C.muted,textAlign:"center",lineHeight:1.8}}>
-                  <strong style={{color:C.text}}>📥 PDF 다운로드</strong> - 직접 PDF 파일 저장 /
-                  <strong style={{color:C.text}}>📦 이미지 ZIP</strong> - 개별 이미지 다운로드 /
-                  <strong style={{color:C.text}}>🖨 인쇄</strong> - 인쇄 또는 브라우저 PDF 저장<br/>
-                  최적 출력을 위해 인쇄 설정에서 <strong style={{color:C.text}}>여백: 없음, 배율: 100%</strong>로 설정하세요.
-                </div>
-              )}
-            </div>
-          );
-        }
-
-        function wrapText(ctx, text, cx, cy, maxW, lh) {
-          if (!text) return;
-          let line="", lines=[];
-          for (const ch of String(text)) {
-            const t = line+ch;
-            if (ctx.measureText(t).width > maxW && line) { lines.push(line); line=ch; } else line=t;
-          }
-          if (line) lines.push(line);
-          const sy = cy - ((lines.length-1)*lh)/2;
-          lines.forEach((l,i) => ctx.fillText(l, cx, sy+i*lh));
-        }
-
-        function renderBadge(canvas, { baseW, baseH, bgImg, logoImg, border, eventName, textColor, zones, fontFamily, topHeightRatio, bgOffset={x:0,y:0}, bgScale=1.0, logoOffset={x:0,y:0}, logoScale=1.0 }, data={}) {
-          const ctx = canvas.getContext("2d");
-          const W=canvas.width, H=canvas.height;
-          const s=Math.min(W/baseW, H/baseH);
-          ctx.clearRect(0,0,W,H);
-
-          if (bgImg) {
-            const sc=Math.max(W/bgImg.width, H/bgImg.height) * bgScale;
-            const x = (W-bgImg.width*sc)/2 + bgOffset.x*s;
-            const y = (H-bgImg.height*sc)/2 + bgOffset.y*s;
-            ctx.drawImage(bgImg, x, y, bgImg.width*sc, bgImg.height*sc);
-          } else {
-            const g=ctx.createLinearGradient(0,0,0,H);
-            g.addColorStop(0,"#e8edf5"); g.addColorStop(1,"#d0d8e8");
-            ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
-            ctx.fillStyle="#9fadbf"; ctx.font=`${11*s}px ${fontFamily},sans-serif`;
-            ctx.textAlign="center"; ctx.textBaseline="middle";
-            ctx.fillText("배경 이미지를 업로드하세요", W/2, H/2);
-          }
-
-          const bt=border.thickness*s;
-          if (bt>0) { ctx.strokeStyle=border.color; ctx.lineWidth=bt; ctx.strokeRect(bt/2,bt/2,W-bt,H-bt); }
-
-          const pad=W*0.1, topH=H*topHeightRatio, botH=H*0.22, midH=H-topH-botH;
-          const z=zones;
-
-          if (z.top.visible && eventName) {
-            const fs=z.top.fontSize*s;
-            ctx.fillStyle=textColor; ctx.font=`700 ${fs}px ${fontFamily},'Noto Sans KR',sans-serif`;
-            ctx.textAlign="center"; ctx.textBaseline="middle";
-            wrapText(ctx, eventName, W/2+z.top.ox*s, topH/2+z.top.oy*s, W-pad*0.4, fs*1.4);
-          }
-
-          const midDefs=[
-            {key:"org",val:data.org,weight:"500",label:""},
-            {key:"position",val:data.position,weight:"400",label:""},
-            {key:"name",val:data.name,weight:"700",label:""},
-            {key:"field1",val:data.field1,weight:"400",label:"추가 1"},
-            {key:"field2",val:data.field2,weight:"400",label:"추가 2"},
-          ].filter(d=>z[d.key]?.visible);
-          if (midDefs.length) {
-            const sp=midH/(midDefs.length+1);
-            midDefs.forEach((d,i)=>{
-              const zz=z[d.key], fs=zz.fontSize*s;
-              ctx.fillStyle=textColor; ctx.font=`${d.weight} ${fs}px ${fontFamily},'Noto Sans KR',sans-serif`;
-              ctx.textAlign="center"; ctx.textBaseline="middle";
-              ctx.fillText(d.val, W/2+zz.ox*s, topH+sp*(i+1)+zz.oy*s, W-pad*2);
-            });
-          }
-
-          const botTop=topH+midH, lz=z.logo;
-          if (lz.visible && logoImg) {
-            const maxW=W*0.55, maxH=botH*0.7;
-            const sc=Math.min(maxW/logoImg.width, maxH/logoImg.height) * logoScale;
-            const lw=logoImg.width*sc, lh=logoImg.height*sc;
-            ctx.drawImage(logoImg, (W-lw)/2+lz.ox*s+logoOffset.x*s, botTop+(botH-lh)/2+lz.oy*s+logoOffset.y*s, lw, lh);
-          }
-        }
-
-        function detectEdgeColor(img) {
-          const c=document.createElement("canvas"); c.width=60; c.height=60;
-          const ctx=c.getContext("2d"); ctx.drawImage(img,0,0,60,60);
-          const pts=[];
-          for(let x=0;x<60;x+=4){pts.push([...ctx.getImageData(x,0,1,1).data.slice(0,3)]);pts.push([...ctx.getImageData(x,59,1,1).data.slice(0,3)]);}
-          for(let y=4;y<56;y+=4){pts.push([...ctx.getImageData(0,y,1,1).data.slice(0,3)]);pts.push([...ctx.getImageData(59,y,1,1).data.slice(0,3)]);}
-          const avg=pts.reduce((a,p)=>[a[0]+p[0],a[1]+p[1],a[2]+p[2]],[0,0,0]).map(v=>Math.round(Math.min(220,Math.max(0,v/pts.length*0.6))));
-          return "#"+avg.map(v=>v.toString(16).padStart(2,"0")).join("");
-        }
-
-        const baseInp={background:"#0d1117",border:"1px solid #30363d",borderRadius:4,color:"#c9d1d9",padding:"6px 8px",fontSize:12,width:"100%",outline:"none"};
-        function Sec({title,children,accent}){return(<div style={{marginBottom:16}}><div style={{fontSize:9.5,fontWeight:700,color:accent||C.muted,textTransform:"uppercase",letterSpacing:"0.13em",marginBottom:7,paddingBottom:5,borderBottom:`1px solid ${C.border}`}}>{title}</div>{children}</div>);}
-        function Row({label,children}){return(<div style={{display:"flex",alignItems:"center",gap:6,marginBottom:7}}>{label&&<span style={{fontSize:11,color:C.muted,flexShrink:0,width:60}}>{label}</span>}<div style={{flex:1,display:"flex",alignItems:"center",gap:5,justifyContent:"flex-end"}}>{children}</div></div>);}
-        function Toggle({on,onChange}){return(<div onClick={()=>onChange(!on)} style={{width:32,height:17,background:on?"#238636":C.border2,borderRadius:9,cursor:"pointer",position:"relative",flexShrink:0,transition:"background .2s"}}><div style={{width:13,height:13,background:"#fff",borderRadius:"50%",position:"absolute",top:2,left:on?17:2,transition:"left .2s"}}/></div>);}
-        function Slider({min=0,max=100,step=1,value,onChange,unit=""}){
-          const [editing,setEditing]=React.useState(false);
-          const [raw,setRaw]=React.useState(String(value));
-          React.useEffect(()=>{if(!editing)setRaw(String(value));},[value,editing]);
-          const commit=(v)=>{
-            const n=parseFloat(v);
-            if(!isNaN(n)) onChange(Math.min(max,Math.max(min,n)));
-            setEditing(false);
-          };
-          return(
-            <div style={{display:"flex",alignItems:"center",gap:6,flex:1}}>
-              <input type="range" min={min} max={max} step={step} value={value} onChange={e=>onChange(+e.target.value)} style={{flex:1}}/>
-              <input type="number" min={min} max={max} step={step} value={editing?raw:value}
-                onFocus={()=>{setEditing(true);setRaw(String(value));}}
-                onChange={e=>{setRaw(e.target.value);const n=parseFloat(e.target.value);if(!isNaN(n))onChange(Math.min(max,Math.max(min,n)));}}
-                onBlur={e=>commit(e.target.value)}
-                onKeyDown={e=>e.key==="Enter"&&commit(raw)}
-                style={{width:52,background:"#0d1117",border:"1px solid #30363d",borderRadius:4,color:C.blue,padding:"2px 5px",fontSize:11,textAlign:"center",outline:"none",fontFamily:"monospace"}}
-              />
-              {unit&&<span style={{fontSize:10,color:C.dim,flexShrink:0}}>{unit}</span>}
-            </div>
-          );
-        }
-
-        function ImgUploadBtn({ id, label, accept, onChange, hasImage, loading }) {
-          return (
-            <label htmlFor={id} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 11px",background:C.bg,border:`1px dashed ${loading?C.orange:hasImage?"#238636":C.border2}`,borderRadius:6,cursor:"pointer",marginBottom:6,userSelect:"none"}}>
-              <span style={{fontSize:15}}>{loading?"⏳":hasImage?"✓":"↑"}</span>
-              <span style={{fontSize:12,color:loading?C.orange:hasImage?C.green:C.muted}}>
-                {loading?"변환 중...":hasImage?label+" (재업로드 가능)":label}
-              </span>
-              <input id={id} type="file" accept={accept} style={{display:"none"}}
-                onChange={e=>{ const f=e.target.files[0]; e.target.value=""; if(f) onChange(f); }}/>
-            </label>
-          );
-        }
-
-        function A4Preview({sz,total}){
-          const {cols,rows,perPage}=calcLayout(sz);
-          const pages=total>0?Math.ceil(total/perPage):1;
-          const sW=120,sH=170,mPx=(A4.margin/A4.w)*sW,gPx=(A4.gap/A4.w)*sW;
-          const bW=(sz.wMM/A4.w)*sW,bH=(sz.hMM/A4.h)*sH;
-          const cells=[];
-          for(let r=0;r<rows;r++) for(let c=0;c<cols;c++) cells.push({x:mPx+c*(bW+gPx),y:mPx+r*(bH+gPx),idx:r*cols+c});
-          return(
-            <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
-              <svg width={sW} height={sH} style={{background:"#fff",borderRadius:2,boxShadow:"0 2px 8px rgba(0,0,0,.4)"}}>
-                {cells.map((c,i)=><rect key={i} x={c.x} y={c.y} width={bW} height={bH} fill={total>0&&c.idx<(total%perPage||perPage)?"#bfdbfe":"#e2e8f0"} stroke="#94a3b8" strokeWidth="0.5" rx="1"/>)}
-                {cells.map((c,i)=><text key={`t${i}`} x={c.x+bW/2} y={c.y+bH/2} textAnchor="middle" dominantBaseline="middle" fontSize="5" fill="#1e40af" fontFamily="sans-serif" fontWeight="600">{c.idx+1}</text>)}
-              </svg>
-              <div style={{fontSize:10,color:C.muted,textAlign:"center",lineHeight:1.6}}>
-                <span style={{color:C.text,fontWeight:700}}>{cols}열×{rows}행</span> = {perPage}매/페이지
-                {total>0&&<><br/>총 <span style={{color:C.green,fontWeight:700}}>{total}명</span> → <span style={{color:C.orange,fontWeight:700}}>{pages}p</span> PDF</>}
-              </div>
-            </div>
-          );
-        }
-
-        function PosNumInput({value,min,max,onChange}){
-          const [editing,setEditing]=React.useState(false);
-          const [raw,setRaw]=React.useState(String(value));
-          React.useEffect(()=>{if(!editing)setRaw(String(value));},[value,editing]);
-          const commit=(v)=>{
-            const n=parseInt(v,10);
-            if(!isNaN(n)) onChange(Math.min(max,Math.max(min,n)));
-            setEditing(false);
-          };
-          return(
-            <input type="number" min={min} max={max} step={1} value={editing?raw:value}
-              onFocus={()=>{setEditing(true);setRaw(String(value));}}
-              onChange={e=>{setRaw(e.target.value);const n=parseInt(e.target.value,10);if(!isNaN(n))onChange(Math.min(max,Math.max(min,n)));}}
-              onBlur={e=>commit(e.target.value)}
-              onKeyDown={e=>e.key==="Enter"&&commit(raw)}
-              style={{width:52,background:"#0d1117",border:`1px solid ${value!==0?"#8b5cf6":"#30363d"}`,borderRadius:4,color:value!==0?C.purple:C.muted,padding:"2px 5px",fontSize:11,textAlign:"center",outline:"none",fontFamily:"monospace",flexShrink:0}}
-            />
-          );
-        }
-
-        function PosControl({ox,oy,onChange,range=120}){
-          const changed=ox!==0||oy!==0;
-          return(
-            <div style={{background:"#0a0e14",border:`1px solid ${changed?C.purple:C.border}`,borderRadius:6,padding:"9px 10px"}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
-                <span style={{fontSize:10,color:changed?C.purple:C.muted,fontWeight:700}}>📍 위치 조정</span>
-                {changed&&<button onClick={()=>onChange(0,0)} style={{fontSize:9,padding:"2px 7px",background:"#3d1b7a",color:"#c4b5fd",border:"none",borderRadius:10,cursor:"pointer"}}>초기화</button>}
-              </div>
-              <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:7}}>
-                <span style={{fontSize:10,color:C.dim,width:24,textAlign:"center"}}>↔</span>
-                <input type="range" min={-range} max={range} value={ox} onChange={e=>onChange(+e.target.value,oy)} style={{flex:1}}/>
-                <PosNumInput value={ox} min={-range} max={range} onChange={v=>onChange(v,oy)}/>
-              </div>
-              <div style={{display:"flex",alignItems:"center",gap:6}}>
-                <span style={{fontSize:10,color:C.dim,width:24,textAlign:"center"}}>↕</span>
-                <input type="range" min={-range} max={range} value={oy} onChange={e=>onChange(ox,+e.target.value)} style={{flex:1}}/>
-                <PosNumInput value={oy} min={-range} max={range} onChange={v=>onChange(ox,v)}/>
-              </div>
-            </div>
-          );
-        }
-
-        function ZoneCard({title,zone,onChange,showFontSize=true,fsRange=[8,72]}){
-          const [open,setOpen]=useState(false);
-          const changed=zone.ox!==0||zone.oy!==0;
-          return(
-            <div style={{background:C.bg,border:`1px solid ${open?C.border2:C.border}`,borderRadius:6,marginBottom:6,overflow:"hidden"}}>
-              <div style={{display:"flex",alignItems:"center",padding:"9px 10px",cursor:"pointer",gap:8}} onClick={()=>setOpen(v=>!v)}>
-                <span style={{fontSize:11,color:C.text,fontWeight:600,flex:1}}>{title}</span>
-                {changed&&<span style={{fontSize:9,padding:"2px 6px",background:"#3d1b7a",color:"#c4b5fd",borderRadius:10}}>위치조정됨</span>}
-                <Toggle on={zone.visible} onChange={v=>onChange({...zone,visible:v})}/>
-                <span style={{fontSize:10,color:C.dim}}>{open?"▲":"▼"}</span>
-              </div>
-              {open&&(
-                <div style={{padding:"0 10px 10px",borderTop:`1px solid ${C.border}`}}>
-                  {showFontSize&&(
-                    <div style={{display:"flex",alignItems:"center",gap:6,marginTop:9,marginBottom:8}}>
-                      <span style={{fontSize:11,color:C.muted,width:60,flexShrink:0}}>글자 크기</span>
-                      <Slider min={fsRange[0]} max={fsRange[1]} value={zone.fontSize} onChange={v=>onChange({...zone,fontSize:v})}/>
-                    </div>
-                  )}
-                  <PosControl ox={zone.ox} oy={zone.oy} onChange={(x,y)=>onChange({...zone,ox:x,oy:y})}/>
-                </div>
-              )}
-            </div>
-          );
-        }
-
-        function NameTagSystem() {
-          const [szIdx,       setSzIdx]       = useState(-1);// CUSTOM_IDX로 직접입력만 사용
-          const [customW,     setCustomW]     = useState("100");
-          const [customH,     setCustomH]     = useState("150");
-          const [bgImg,       setBgImg]       = useState(null);
-          const [logoImg,     setLogoImg]     = useState(null);
-          const [bgLoading,   setBgLoading]   = useState(false);
-          const [logoLoading, setLogoLoading] = useState(false);
-          const [bgOffset,    setBgOffset]    = useState({x:0, y:0});
-          const [bgScale,     setBgScale]     = useState(1.0);
-          const [logoOffset,  setLogoOffset]  = useState({x:0, y:0});
-          const [logoScale,   setLogoScale]   = useState(1.0);
-          const [border,      setBorder]      = useState({color:"#1e3a8a",thickness:4});
-          const [autoColor,   setAutoColor]   = useState(true);
-          const [eventName,   setEventName]   = useState("2026 중소기업 CEO 포럼");
-          const [textColor,   setTextColor]   = useState("#1a1a2e");
-          const [fontFamily,  setFontFamily]  = useState("Pretendard");
-          const [zones,       setZones]       = useState({
-            top:      mkZone({fontSize:22}),
-            org:      mkZone({fontSize:15}),
-            position: mkZone({fontSize:13}),
-            name:     mkZone({fontSize:28}),
-            field1:   {visible:true,fontSize:12,ox:0,oy:0},
-            field2:   {visible:true,fontSize:12,ox:0,oy:0},
-            logo:     {visible:true,fontSize:14,ox:0,oy:0},
-          });
-          const [topHeightRatio, setTopHeightRatio] = useState(0.22);
-          const [csvData,  setCsvData]  = useState([]);
-          const [headers,  setHeaders]  = useState([]);
-          const [colMap,   setColMap]   = useState({org:-1,position:-1,name:-1,field1:-1,field2:-1});
-          const [pidx,     setPidx]     = useState(0);
-          const [tab,      setTab]      = useState("design");
-          const [exporting,setExporting]= useState(false);
-          const [pdfPreview,setPdfPreview]= useState(null);
-          const [expProg,  setExpProg]  = useState({cur:0,total:0});
-          const [expMsg,   setExpMsg]   = useState("");
-
-          const canvasRef = useRef(null);
-          const safeW = Math.min(400, Math.max(10, parseFloat(customW) || 10));
-          const safeH = Math.min(400, Math.max(10, parseFloat(customH) || 10));
-          const sz = szIdx === CUSTOM_IDX
-            ? mkCustomSz(safeW, safeH)
-            : SIZES[szIdx];
-
-          const getRowData = (row) => ({
-            org:      colMap.org>=0      && row ? String(row[colMap.org]     ??"") : "",
-            position: colMap.position>=0 && row ? String(row[colMap.position]??"") : "",
-            name:     colMap.name>=0     && row ? String(row[colMap.name]    ??"") : "",
-            field1:   colMap.field1>=0   && row ? String(row[colMap.field1]  ??"") : "",
-            field2:   colMap.field2>=0   && row ? String(row[colMap.field2]  ??"") : "",
-          });
-          const previewData = csvData.length>0 ? getRowData(csvData[pidx])
-            : {org:"중소기업중앙회", position:"팀장", name:"홍 길 동", field1:"개발팀", field2:"서울"};
-
-          useLayoutEffect(() => {
-            const canvas = canvasRef.current;
-            if (!canvas) return;
-            if (canvas.width !== sz.w)  canvas.width  = sz.w;
-            if (canvas.height !== sz.h) canvas.height = sz.h;
-            renderBadge(canvas, {baseW:sz.w, baseH:sz.h, bgImg, logoImg, border, eventName, textColor, zones, fontFamily, topHeightRatio, bgOffset, bgScale, logoOffset, logoScale}, previewData);
-          });
-
-          const handleBgFile = (file) => {
-            setBgLoading(true);
-            const reader = new FileReader();
-            reader.onload = (e) => {
-              const img = new Image();
-              img.onload = () => {
-                setBgImg(img);
-                setBgLoading(false);
-                if (autoColor) setBorder(p => ({...p, color:detectEdgeColor(img)}));
-              };
-              img.onerror = () => { setBgLoading(false); alert("이미지 로드 실패"); };
-              img.src = e.target.result;
-            };
-            reader.onerror = () => { setBgLoading(false); alert("파일 읽기 실패"); };
-            reader.readAsDataURL(file);
-          };
-
-          const handleLogoFile = (file) => {
-            setLogoLoading(true);
-            const reader = new FileReader();
-            reader.onload = (e) => {
-              const img = new Image();
-              img.onload = () => { setLogoImg(img); setLogoLoading(false); };
-              img.onerror = () => { setLogoLoading(false); alert("로고 로드 실패"); };
-              img.src = e.target.result;
-            };
-            reader.onerror = () => { setLogoLoading(false); alert("파일 읽기 실패"); };
-            reader.readAsDataURL(file);
-          };
-
-          const handleCsv = (e) => {
-            const f=e.target.files[0]; if(!f) return;
-            const r=new FileReader();
-            r.onload=ev=>{
-              try{
-                const wb=XLSX.read(ev.target.result,{type:"binary"});
-                const ws=wb.Sheets[wb.SheetNames[0]];
-                const raw=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
-                if(!raw.length) return;
-                const hdrs=raw[0].map(String);
-                const rows=raw.slice(1).filter(r=>r.some(v=>String(v).trim()));
-                setHeaders(hdrs); setCsvData(rows); setPidx(0);
-                const find=kws=>hdrs.findIndex(h=>kws.some(k=>h.includes(k)));
-                setColMap({org:find(["소속","업체","기관","회사"]),position:find(["직위","직급","직책"]),name:find(["이름","성명","성함"]),field1:find(["추가 1","추가1","추가필드 1","추가필드1"]),field2:find(["추가 2","추가2","추가필드 2","추가필드2"])});
-              }catch(err){alert("파일 파싱 오류: "+err.message);}
-            };
-            r.readAsBinaryString(f);
-          };
-
-          const exportOne = () => {
-            const c=document.createElement("canvas"); c.width=sz.ew; c.height=sz.eh;
-            renderBadge(c,{baseW:sz.w,baseH:sz.h,bgImg,logoImg,border,eventName,textColor,zones,fontFamily,topHeightRatio},previewData);
-            const dataUrl = c.toDataURL("image/png");
-            setPdfPreview({ type:"image", url:dataUrl, name:`badge_${previewData.name||"preview"}.png` });
-          };
-
-          const exportPDF = async () => {
-            if (!csvData.length) return;
-            setExporting(true);
-
-            const { cols, rows, perPage } = calcLayout(sz);
-            const total = csvData.length;
-            const cfg = { baseW:sz.w, baseH:sz.h, bgImg, logoImg, border, eventName, textColor, zones, bgOffset, bgScale, logoOffset, logoScale };
-
-            const images = [];
-            const printW = Math.round(sz.ew);
-            const printH = Math.round(sz.eh);
-            
-            for (let i = 0; i < total; i++) {
-              setExpProg({ cur:i+1, total });
-              setExpMsg(`명찰 렌더링 중... (${i+1}/${total})`);
-              const cv = document.createElement("canvas");
-              cv.width = printW; cv.height = printH;
-              renderBadge(cv, {...cfg, fontFamily, topHeightRatio}, getRowData(csvData[i]));
-              images.push(cv.toDataURL("image/jpeg", 0.85));
-              if (i % 2 === 1) await new Promise(r => setTimeout(r, 0));
-            }
-
-            setExpMsg("HTML 페이지 조합 중...");
-            await new Promise(r => setTimeout(r, 0));
-
-            const bW = sz.wMM, bH = sz.hMM;
-            const margin = A4.margin, gap = A4.gap;
-
-            const pages = [];
-            for (let p = 0; p < Math.ceil(total / perPage); p++) {
-              pages.push(images.slice(p * perPage, (p + 1) * perPage));
-            }
-
-            let pageHtml = "";
-            for (let pIdx = 0; pIdx < pages.length; pIdx++) {
-              const pageImgs = pages[pIdx];
-              setExpProg({ cur: Math.min(total + pIdx, total), total: total + pages.length });
-              setExpMsg(`PDF 페이지 생성 중... (${pIdx+1}/${pages.length})`);
-              const cells = pageImgs.map((src, idx) => {
-                const col = idx % cols;
-                const row = Math.floor(idx / cols);
-                const x = margin + col * (bW + gap);
-                const y = margin + row * (bH + gap);
-                return `<img src="${src}" style="position:absolute;left:${x}mm;top:${y}mm;width:${bW}mm;height:${bH}mm;display:block;" />`;
-              }).join("");
-              pageHtml += `<div class="page">${cells}</div>`;
-              if (pIdx % 2 === 1) await new Promise(r => setTimeout(r, 0));
-            }
-
-            const html = `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<title>명찰 출력 — ${eventName||"badge"}</title>
-<style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:#888; }
-  .page {
-    position: relative;
-    width: 210mm;
-    height: 297mm;
-    background: #fff;
-    margin: 0 auto 8mm;
-    overflow: hidden;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.3);
-  }
-  @media print {
-    body { background: none; }
-    .page {
-      margin: 0;
-      box-shadow: none;
-      page-break-after: always;
-    }
-    .page:last-child { page-break-after: avoid; }
-  }
-</style>
-</head>
-<body>${pageHtml}</body>
-</html>`;
-
-            setPdfPreview({
-              type: "html",
-              html,
-              name: `명찰_${eventName||"badge"}_${total}명`,
-            });
-            setExporting(false); setExpMsg(""); setExpProg({ cur:0, total:0 });
-          };
-
-          // ── html2pdf를 사용한 직접 PDF 다운로드 ──
-          const exportPDFDirect = async () => {
-            if (!csvData.length) return;
-            setExporting(true);
-            try {
-              const { cols, rows, perPage } = calcLayout(sz);
-              const total = csvData.length;
-              const cfg = { baseW:sz.w, baseH:sz.h, bgImg, logoImg, border, eventName, textColor, zones, bgOffset, bgScale, logoOffset, logoScale };
-
-              const images = [];
-              const printW = Math.round(sz.ew * DPI_SCALE);
-              const printH = Math.round(sz.eh * DPI_SCALE);
-              
-              for (let i = 0; i < total; i++) {
-                setExpProg({ cur:i+1, total:total+Math.ceil(total/perPage) });
-                setExpMsg(`명찰 렌더링 중... (${i+1}/${total})`);
-                const cv = document.createElement("canvas");
-                cv.width = printW; cv.height = printH;
-                renderBadge(cv, {...cfg, fontFamily, topHeightRatio}, getRowData(csvData[i]));
-                images.push(cv.toDataURL("image/jpeg", 0.85));
-                if (i % 2 === 1) await new Promise(r => setTimeout(r, 0));
-              }
-
-              setExpMsg("PDF 생성 중...");
-              const bW = sz.wMM, bH = sz.hMM;
-              const margin = A4.margin, gap = A4.gap;
-
-              const pages = [];
-              for (let p = 0; p < Math.ceil(total / perPage); p++) {
-                pages.push(images.slice(p * perPage, (p + 1) * perPage));
-              }
-
-              let pageHtml = "";
-              for (let pIdx = 0; pIdx < pages.length; pIdx++) {
-                const pageImgs = pages[pIdx];
-                setExpProg({ cur: total + pIdx, total: total + pages.length });
-                setExpMsg(`PDF 페이지 생성 중... (${pIdx+1}/${pages.length})`);
-                const cells = pageImgs.map((src, idx) => {
-                  const col = idx % cols;
-                  const row = Math.floor(idx / cols);
-                  const x = margin + col * (bW + gap);
-                  const y = margin + row * (bH + gap);
-                  return `<img src="${src}" style="position:absolute;left:${x}mm;top:${y}mm;width:${bW}mm;height:${bH}mm;display:block;" />`;
-                }).join("");
-                pageHtml += `<div style="position:relative;width:210mm;height:297mm;background:#fff;margin-bottom:8mm;overflow:hidden;">${cells}</div>`;
-                if (pIdx % 2 === 1) await new Promise(r => setTimeout(r, 0));
-              }
-
-              setExpMsg("파일 생성 중...");
-              await new Promise(r => setTimeout(r, 100));
-
-              // HTML을 파일로 직접 다운로드
-              const html = `<!DOCTYPE html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8"/>
-  <title>명찰 출력 — ${eventName||"badge"}</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>명찰/명패 출력 시스템</title>
+  <!-- [웹 버전] Pretendard 웹폰트 CDN 고정 -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <!-- [웹 버전] vendor/ 로컬 파일 → CDN으로 변경 (Electron 오프라인 불필요) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <style>
-    * { margin:0; padding:0; box-sizing:border-box; }
-    body { background:#888; font-family:Arial,sans-serif; }
-    .page {
-      position:relative; width:210mm; height:297mm; background:#fff;
-      margin:0 auto 8mm; overflow:hidden; box-shadow:0 2px 12px rgba(0,0,0,.3);
-    }
-    @media print {
-      body { background:none; margin:0; }
-      .page { margin:0; box-shadow:none; page-break-after:always; }
-      .page:last-child { page-break-after:avoid; }
-    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+    body { background: #0d1117; color: #c9d1d9; font-family: 'Pretendard', -apple-system, sans-serif; }
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+    input[type=color] { -webkit-appearance: none; border: 1px solid #30363d; border-radius: 4px; overflow: hidden; cursor: pointer; }
+    input[type=color]::-webkit-color-swatch-wrapper { padding: 0; }
+    input[type=color]::-webkit-color-swatch { border: none; }
+    input[type=range] { -webkit-appearance: none; appearance: none; height: 3px; border-radius: 2px; background: #30363d; outline: none; cursor: pointer; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 13px; height: 13px; border-radius: 50%; background: #58a6ff; cursor: pointer; }
+    select, button, input { outline: none; font-family: 'Pretendard', -apple-system, sans-serif; }
   </style>
 </head>
-<body>${pageHtml}</body>
-</html>`;
+<body>
+  <div id="root"></div>
 
-              const blob = new Blob([html], {type:'text/html;charset=utf-8'});
-              const link = document.createElement('a');
-              link.href = URL.createObjectURL(blob);
-              link.download = `명찰_${eventName||"badge"}_${total}명.html`;
-              document.body.appendChild(link);
-              link.click();
-              document.body.removeChild(link);
-              setTimeout(() => URL.revokeObjectURL(link.href), 100);
+  <script type="text/babel">
+    const { useState, useRef, useLayoutEffect, useEffect, useCallback } = React;
 
-              setExporting(false); setExpMsg(""); setExpProg({ cur:0, total:0 });
-              alert('파일이 다운로드되었습니다!\n\n1. 다운로드 받은 HTML 파일을 브라우저로 열기\n2. Ctrl+P (또는 Cmd+P) 로 인쇄 설정 열기\n3. 인쇄 > PDF로 저장 선택');
-            } catch(err) {
-              console.error(err);
-              alert("파일 생성 오류: "+err.message);
-              setExporting(false); setExpMsg(""); setExpProg({ cur:0, total:0 });
+    /* ── 상수 ──────────────────────────────────────────────────────── */
+    const MM = 3.7795275591; // mm → px (96dpi)
+    const PRINT_DPI = 300;
+    const MM_HI = 11.811;   // mm → px (300dpi, for canvas)
+
+    const C = {
+      bg:"#0d1117", surface:"#161b22", border:"#21262d", border2:"#30363d",
+      text:"#c9d1d9", muted:"#8b949e", dim:"#484f58",
+      blue:"#58a6ff", green:"#3fb950", accent:"#1f6feb",
+      purple:"#8b5cf6", orange:"#f0883e", red:"#f85149",
+    };
+
+    /* ── 크기 프리셋 ────────────────────────────────────────────────── */
+    const SIZES = [
+      { label:"소형",   sub:"80×110mm",  wMM:80,  hMM:110 },
+      { label:"표준",   sub:"90×120mm",  wMM:90,  hMM:120 },
+      { label:"중형",   sub:"90×130mm",  wMM:90,  hMM:130 },
+      { label:"대형",   sub:"105×148mm", wMM:105, hMM:148 },
+      { label:"와이드", sub:"100×150mm", wMM:100, hMM:150 },
+    ];
+    SIZES.forEach(s => {
+      const pw = Math.min(260, Math.round(240 * s.wMM / Math.max(s.wMM, s.hMM)));
+      s.w = pw; s.h = Math.round(pw * s.hMM / s.wMM);
+      s.ew = Math.round(s.wMM * MM_HI); s.eh = Math.round(s.hMM * MM_HI);
+      s.lw = Math.round(s.wMM / 25.4 * 96); s.lh = Math.round(s.hMM / 25.4 * 96);
+    });
+
+    const mkCustomSz = (wMM, hMM) => {
+      const pw = Math.min(260, Math.round(240 * wMM / Math.max(wMM, hMM)));
+      return {
+        label:"직접입력", sub:`${wMM}×${hMM}mm`, wMM, hMM,
+        w: pw, h: Math.round(pw * hMM / wMM),
+        ew: Math.round(wMM * MM_HI), eh: Math.round(hMM * MM_HI),
+        lw: Math.round(wMM / 25.4 * 96), lh: Math.round(hMM / 25.4 * 96),
+      };
+    };
+
+    const A4 = { w:210, h:297, margin:8, gap:3 };
+    const calcLayout = (sz) => {
+      const cols = Math.max(1, Math.floor((A4.w - A4.margin*2 + A4.gap) / (sz.wMM + A4.gap)));
+      const rows = Math.max(1, Math.floor((A4.h - A4.margin*2 + A4.gap) / (sz.hMM + A4.gap)));
+      return { cols, rows, perPage: cols*rows };
+    };
+
+    /* ── 유틸 ──────────────────────────────────────────────────────── */
+    function fileToImage(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = e => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = () => reject(new Error("이미지 변환 실패"));
+          img.src = e.target.result;
+        };
+        reader.onerror = () => reject(new Error("파일 읽기 실패"));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function wrapText(ctx, text, cx, cy, maxW, lh) {
+      if (!text) return;
+      const chars = String(text).split('');
+      let line = "", lines = [];
+      for (const ch of chars) {
+        const t = line + ch;
+        if (ctx.measureText(t).width > maxW && line) { lines.push(line); line = ch; }
+        else line = t;
+      }
+      if (line) lines.push(line);
+      const sy = cy - ((lines.length - 1) * lh) / 2;
+      lines.forEach((l, i) => ctx.fillText(l, cx, sy + i * lh));
+    }
+
+    // 텍스트가 길면 글자 크기를 자동 축소하여 avH 높이 안에 맞춤
+    function autoFitText(ctx, text, cx, cy, maxW, avH, fs, lhRatio, fontSpec, color) {
+      if (!text) return;
+      const MIN_FS = 5;
+      let curFs = fs;
+      ctx.font = fontSpec(curFs);
+      while (curFs > MIN_FS && ctx.measureText(String(text)).width > maxW) {
+        curFs = Math.max(MIN_FS, Math.floor(curFs * 0.92));
+        ctx.font = fontSpec(curFs);
+      }
+      ctx.fillStyle = color;
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(String(text), cx, cy);
+    }
+
+    /* ── 줄명찰 렌더링 ──────────────────────────────────────────────── */
+    function renderTag(canvas, cfg, data = {}) {
+      const ctx = canvas.getContext("2d");
+      const W = canvas.width, H = canvas.height;
+      const s = Math.min(W / cfg.baseW, H / cfg.baseH);
+      ctx.clearRect(0, 0, W, H);
+
+      // 배경 (cover: 항상 전체를 채움, 여백 없음)
+      if (cfg.bgImg) {
+        const sc = Math.max(W / cfg.bgImg.width, H / cfg.bgImg.height) * cfg.bgScale;
+        const bx = (W - cfg.bgImg.width * sc) / 2 + cfg.bgOffset.x * s;
+        const by = (H - cfg.bgImg.height * sc) / 2 + cfg.bgOffset.y * s;
+        ctx.save();
+        ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip();
+        ctx.drawImage(cfg.bgImg, bx, by, cfg.bgImg.width * sc, cfg.bgImg.height * sc);
+        ctx.restore();
+      } else {
+        const g = ctx.createLinearGradient(0, 0, 0, H);
+        g.addColorStop(0, "#eef2f8"); g.addColorStop(1, "#dce4f0");
+        ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = "#a0aebf";
+        ctx.font = `${10 * s}px 'Pretendard',sans-serif`;
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText("배경 이미지를 업로드하세요", W / 2, H / 2);
+      }
+
+      // 상단 헤더 (행사명)
+      const headerH = H * cfg.headerRatio;
+      const headerTop = 0;
+      const { zones, textColor, fontFamily, eventName, logoImg, logoScale, logoOffset } = cfg;
+
+      if (zones.top.visible && eventName) {
+        const fs = zones.top.fontSize * s;
+        const hPad = (cfg.border.thickness + 5) * s;
+        autoFitText(ctx, eventName, W/2 + (zones.top.ox/100)*(W/2), headerTop + headerH/2 + (zones.top.oy/100)*(H/2), W - hPad*2, headerH, fs, 1.35,
+          (size) => `700 ${size}px ${fontFamily},'Pretendard',sans-serif`, textColor);
+      }
+
+      // 본문 영역 (소속·이름·직위·추가정보)
+      const footerH = H * cfg.footerRatio;
+      const bodyTop = headerH;
+      const bodyH = H - bodyTop - footerH;
+
+      const bodyDefs = [
+        { key:"org",      val:data.org,      weight:"500" },
+        { key:"name",     val:data.name,     weight:"800" },
+        { key:"position", val:data.position, weight:"400" },
+        { key:"field1",   val:data.field1,   weight:"400" },
+        { key:"field2",   val:data.field2,   weight:"400" },
+      ].filter(d => zones[d.key]?.visible);
+
+      if (bodyDefs.length) {
+        const sp = bodyH / (bodyDefs.length + 1);
+        const bPad = (cfg.border.thickness + 5) * s;
+        bodyDefs.forEach((d, i) => {
+          if (!d.val) return;
+          const zz = zones[d.key];
+          const fs = zz.fontSize * s;
+          autoFitText(ctx, d.val, W/2 + (zz.ox/100)*(W/2), bodyTop + sp*(i+1) + (zz.oy/100)*(H/2), W - bPad*2, sp, fs, 1.3,
+            (size) => `${d.weight} ${size}px ${fontFamily},'Pretendard',sans-serif`, textColor);
+        });
+      } else if (!data.name && !data.org) {
+        // 샘플 표시
+        const fs = 18 * s;
+        ctx.fillStyle = "rgba(100,130,170,0.4)";
+        ctx.font = `700 ${fs}px ${fontFamily},'Pretendard',sans-serif`;
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText("홍 길 동", W/2, bodyTop + bodyH*0.38);
+        ctx.font = `500 ${fs*0.6}px ${fontFamily},'Pretendard',sans-serif`;
+        ctx.fillText("○○기업 · 대표이사", W/2, bodyTop + bodyH*0.62);
+      }
+
+      // 하단 로고
+      const footerTop = H - footerH;
+      if (zones.logo.visible && logoImg) {
+        const lz = zones.logo;
+        const maxW = W * 0.6, maxH = footerH * 0.72;
+        const sc = Math.min(maxW / logoImg.width, maxH / logoImg.height) * logoScale;
+        const lw = logoImg.width * sc, lh = logoImg.height * sc;
+        ctx.drawImage(logoImg, (W-lw)/2 + (lz.ox/100)*(W/2), footerTop + (footerH-lh)/2 + (lz.oy/100)*(H/2), lw, lh);
+      }
+
+      // 테두리 (마지막에 그려서 모든 요소 위에 표시)
+      const bt = cfg.border.thickness * s;
+      if (bt > 0) {
+        ctx.strokeStyle = cfg.border.color;
+        ctx.lineWidth = bt;
+        ctx.strokeRect(bt / 2, bt / 2, W - bt, H - bt);
+      }
+    }
+
+    /* ── 인쇄 HTML 생성 ─────────────────────────────────────────────── */
+    async function buildPrintHtml(sz, cfg, dataList, onProgress) {
+      const images = [];
+      for (let i = 0; i < dataList.length; i++) {
+        onProgress && onProgress(i + 1, dataList.length);
+        const c = document.createElement('canvas');
+        c.width = sz.ew; c.height = sz.eh;
+        renderTag(c, cfg, dataList[i]);
+        images.push(c.toDataURL('image/png'));
+        await new Promise(r => setTimeout(r, 0));
+      }
+
+      const { cols, rows, perPage } = calcLayout(sz);
+      const pages = Math.ceil(images.length / perPage);
+
+      let html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>
+  @page{size:A4 portrait;margin:0;}
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{background:#fff;}
+  .page{width:210mm;height:297mm;position:relative;overflow:hidden;page-break-after:always;}
+  .tag{position:absolute;}
+  .tag img{display:block;width:100%;height:100%;}
+</style></head><body>`;
+
+      for (let p = 0; p < pages; p++) {
+        html += `<div class="page">`;
+        for (let i = 0; i < perPage; i++) {
+          const idx = p * perPage + i;
+          if (idx >= images.length) break;
+          const r = Math.floor(i / cols), c2 = i % cols;
+          const x = A4.margin + c2 * (sz.wMM + A4.gap);
+          const y = A4.margin + r * (sz.hMM + A4.gap);
+          html += `<div class="tag" style="left:${x}mm;top:${y}mm;width:${sz.wMM}mm;height:${sz.hMM}mm;">
+  <img src="${images[idx]}"/>
+</div>`;
+        }
+        html += `</div>`;
+      }
+      html += `</body></html>`;
+      return html;
+    }
+
+    /* ── 기본 UI 컴포넌트 ────────────────────────────────────────────── */
+    const inp = { background:"#0d1117", border:`1px solid #30363d`, borderRadius:4, color:"#c9d1d9", padding:"6px 8px", fontSize:12, width:"100%", outline:"none" };
+    function Sec({ title, children, accent }) {
+      return (
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:9.5,fontWeight:700,color:accent||C.muted,textTransform:"uppercase",letterSpacing:"0.13em",marginBottom:7,paddingBottom:5,borderBottom:`1px solid ${C.border}`}}>{title}</div>
+          {children}
+        </div>
+      );
+    }
+    function Row({ label, children }) {
+      return (
+        <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:7}}>
+          {label && <span style={{fontSize:11,color:C.muted,flexShrink:0,width:56}}>{label}</span>}
+          <div style={{flex:1,display:"flex",alignItems:"center",gap:5,justifyContent:"flex-end"}}>{children}</div>
+        </div>
+      );
+    }
+    function Toggle({ on, onChange }) {
+      return (
+        <div onClick={() => onChange(!on)} style={{width:32,height:17,background:on?"#238636":C.border2,borderRadius:9,cursor:"pointer",position:"relative",flexShrink:0,transition:"background .2s"}}>
+          <div style={{width:13,height:13,background:"#fff",borderRadius:"50%",position:"absolute",top:2,left:on?17:2,transition:"left .2s"}}/>
+        </div>
+      );
+    }
+    function Slider({ min=0, max=100, step=1, value, onChange, unit="" }) {
+      const [editing, setEditing] = useState(false);
+      const [raw, setRaw] = useState(String(value));
+      useEffect(() => { if (!editing) setRaw(String(value)); }, [value, editing]);
+      const commit = v => {
+        const n = parseFloat(v);
+        if (!isNaN(n)) onChange(Math.min(max, Math.max(min, n)));
+        setEditing(false);
+      };
+      return (
+        <div style={{display:"flex",alignItems:"center",gap:6,flex:1}}>
+          <input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(+e.target.value)} style={{flex:1}}/>
+          <input type="number" min={min} max={max} step={step} value={editing ? raw : value}
+            onFocus={() => { setEditing(true); setRaw(String(value)); }}
+            onChange={e => { setRaw(e.target.value); const n = parseFloat(e.target.value); if (!isNaN(n)) onChange(Math.min(max, Math.max(min, n))); }}
+            onBlur={e => commit(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && commit(raw)}
+            style={{width:50,background:"#0d1117",border:"1px solid #30363d",borderRadius:4,color:C.blue,padding:"2px 5px",fontSize:11,textAlign:"center",outline:"none",fontFamily:"monospace"}}
+          />
+          {unit && <span style={{fontSize:10,color:C.dim,flexShrink:0}}>{unit}</span>}
+        </div>
+      );
+    }
+    function ImgUploadBtn({ id, label, accept, onChange, hasImage, loading }) {
+      return (
+        <label htmlFor={id} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 11px",background:C.bg,border:`1px dashed ${loading?C.orange:hasImage?"#238636":C.border2}`,borderRadius:6,cursor:"pointer",marginBottom:6,userSelect:"none"}}>
+          <span style={{fontSize:14}}>{loading?"⏳":hasImage?"✓":"↑"}</span>
+          <span style={{fontSize:12,color:loading?C.orange:hasImage?C.green:C.muted}}>
+            {loading?"변환 중...":hasImage?label+" (재업로드)":label}
+          </span>
+          <input id={id} type="file" accept={accept} style={{display:"none"}}
+            onChange={e => { const f = e.target.files[0]; e.target.value = ""; if (f) onChange(f); }}/>
+        </label>
+      );
+    }
+
+    function PosControl({ ox, oy, onChange, range=100 }) {
+      const changed = ox !== 0 || oy !== 0;
+      const numSt = (v) => ({width:50,background:"#0d1117",border:`1px solid ${v!==0?C.purple:"#30363d"}`,borderRadius:4,color:v!==0?C.purple:C.muted,padding:"2px 5px",fontSize:11,textAlign:"center",outline:"none",fontFamily:"monospace",flexShrink:0});
+      return (
+        <div style={{background:"#0a0e14",border:`1px solid ${changed?C.purple:C.border}`,borderRadius:6,padding:"9px 10px"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:7}}>
+            <span style={{fontSize:10,color:changed?C.purple:C.muted,fontWeight:700}}>📍 위치 조정</span>
+            {changed && <button onClick={() => onChange(0,0)} style={{fontSize:9,padding:"2px 7px",background:"#3d1b7a",color:"#c4b5fd",border:"none",borderRadius:10,cursor:"pointer"}}>초기화</button>}
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
+            <span style={{fontSize:10,color:C.dim,width:20,textAlign:"center"}}>↔</span>
+            <input type="range" min={-range} max={range} value={ox} onChange={e => onChange(+e.target.value, oy)} style={{flex:1}}/>
+            <input type="number" min={-range} max={range} value={ox}
+              onChange={e => { const n=parseInt(e.target.value,10); if(!isNaN(n)) onChange(Math.min(range,Math.max(-range,n)),oy); }}
+              style={numSt(ox)}/>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <span style={{fontSize:10,color:C.dim,width:20,textAlign:"center"}}>↕</span>
+            <input type="range" min={-range} max={range} value={oy} onChange={e => onChange(ox, +e.target.value)} style={{flex:1}}/>
+            <input type="number" min={-range} max={range} value={oy}
+              onChange={e => { const n=parseInt(e.target.value,10); if(!isNaN(n)) onChange(ox,Math.min(range,Math.max(-range,n))); }}
+              style={numSt(oy)}/>
+          </div>
+        </div>
+      );
+    }
+
+    function ZoneCard({ title, zone, onChange, fsRange=[8,200] }) {
+      const [open, setOpen] = useState(false);
+      const changed = zone.ox !== 0 || zone.oy !== 0;
+      return (
+        <div style={{background:C.bg,border:`1px solid ${open?C.border2:C.border}`,borderRadius:6,marginBottom:5,overflow:"hidden"}}>
+          <div style={{display:"flex",alignItems:"center",padding:"8px 10px",cursor:"pointer",gap:8}} onClick={() => setOpen(v => !v)}>
+            <span style={{fontSize:11,color:C.text,fontWeight:600,flex:1}}>{title}</span>
+            {changed && <span style={{fontSize:9,padding:"2px 6px",background:"#3d1b7a",color:"#c4b5fd",borderRadius:10}}>조정됨</span>}
+            <Toggle on={zone.visible} onChange={v => onChange({...zone,visible:v})}/>
+            <span style={{fontSize:10,color:C.dim}}>{open?"▲":"▼"}</span>
+          </div>
+          {open && (
+            <div style={{padding:"0 10px 10px",borderTop:`1px solid ${C.border}`}}>
+              <div style={{display:"flex",alignItems:"center",gap:6,marginTop:9,marginBottom:8}}>
+                <span style={{fontSize:11,color:C.muted,width:56,flexShrink:0}}>글자 크기</span>
+                <Slider min={fsRange[0]} max={fsRange[1]} value={zone.fontSize} onChange={v => onChange({...zone,fontSize:v})} unit="px"/>
+              </div>
+              <PosControl ox={zone.ox} oy={zone.oy} onChange={(x,y) => onChange({...zone,ox:x,oy:y})}/>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ── A4 배치 미리보기 ───────────────────────────────────────────── */
+    function A4Preview({ sz, total }) {
+      const { cols, rows, perPage } = calcLayout(sz);
+      const pages = total > 0 ? Math.ceil(total / perPage) : 1;
+      const sW=100, sH=141, mPx=(A4.margin/A4.w)*sW, gPx=(A4.gap/A4.w)*sW;
+      const bW=(sz.wMM/A4.w)*sW, bH=(sz.hMM/A4.h)*sH;
+      const cells = [];
+      for (let r=0;r<rows;r++) for (let c=0;c<cols;c++) cells.push({x:mPx+c*(bW+gPx), y:mPx+r*(bH+gPx), idx:r*cols+c});
+      return (
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6}}>
+          <svg width={sW} height={sH} style={{background:"#fff",borderRadius:2,boxShadow:"0 2px 8px rgba(0,0,0,.4)"}}>
+            {cells.map((c,i) => <rect key={i} x={c.x} y={c.y} width={bW} height={bH} fill={total>0&&c.idx<(total%perPage||perPage)?"#bfdbfe":"#e2e8f0"} stroke="#94a3b8" strokeWidth="0.4" rx="0.5"/>)}
+            {cells.map((c,i) => <text key={`t${i}`} x={c.x+bW/2} y={c.y+bH/2} textAnchor="middle" dominantBaseline="middle" fontSize="4.5" fill="#1e40af" fontFamily="sans-serif" fontWeight="600">{c.idx+1}</text>)}
+          </svg>
+          <div style={{fontSize:10,color:C.muted,textAlign:"center",lineHeight:1.6}}>
+            <span style={{color:C.text,fontWeight:700}}>{cols}열×{rows}행</span> · {perPage}매/페이지
+            {total > 0 && <><br/><span style={{color:C.green,fontWeight:700}}>{total}명</span> → <span style={{color:C.orange,fontWeight:700}}>{pages}p</span></>}
+          </div>
+        </div>
+      );
+    }
+
+    /* ── CSV 샘플 박스 ──────────────────────────────────────────────── */
+    const SAMPLE_CSV = "소속,직위,이름,추가 1,추가 2\n중소기업중앙회,팀장,홍길동,개발팀,서울\n○○기업,대표이사,김철수,영업팀,부산\n△△협회,사무국장,이영희,기획팀,대구";
+    function SampleCsvBox() {
+      const [copied, setCopied] = useState(false);
+      const copy = () => {
+        try { navigator.clipboard.writeText(SAMPLE_CSV).then(() => { setCopied(true); setTimeout(()=>setCopied(false),2000); }); }
+        catch { const ta=document.getElementById("scsv"); if(ta){ta.select();document.execCommand("copy");setCopied(true);setTimeout(()=>setCopied(false),2000);} }
+      };
+      return (
+        <div style={{background:"#0a0e14",border:`1px solid ${C.border2}`,borderRadius:6,padding:10,marginTop:4}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:5}}>
+            <span style={{fontSize:10,color:C.muted,fontWeight:600}}>📋 CSV 샘플 형식</span>
+            <button onClick={copy} style={{fontSize:10,padding:"3px 8px",background:copied?"#238636":C.accent,color:"#fff",border:"none",borderRadius:4,cursor:"pointer"}}>
+              {copied?"✓ 복사됨":"복사"}
+            </button>
+          </div>
+          <textarea id="scsv" readOnly value={SAMPLE_CSV}
+            style={{width:"100%",height:68,background:"#060a0f",border:`1px solid ${C.border}`,borderRadius:4,color:"#7ee787",fontSize:10.5,fontFamily:"'Consolas','Courier New',monospace",padding:"5px 7px",resize:"none",outline:"none"}}
+          />
+        </div>
+      );
+    }
+
+    /* ── 인쇄 미리보기 모달 ────────────────────────────────────────── */
+    function PrintModal({ html, onClose, onPrint, onSavePdf, onSaveZip, busy, msg, prog }) {
+      if (!html) return null;
+      return (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.9)",zIndex:9999,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:10,padding:14}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,width:"100%",maxWidth:860,flexWrap:"wrap"}}>
+            <div style={{flex:1}}>
+              <div style={{fontSize:13,color:C.blue,fontWeight:700}}>📄 A4 줄명찰 출력 미리보기</div>
+              {msg && <div style={{fontSize:10,color:C.orange,marginTop:3}}>{msg}{prog?.total>0&&` (${prog.cur}/${prog.total})`}</div>}
+            </div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap",flexShrink:0}}>
+              <button onClick={onPrint} disabled={busy}
+                style={{padding:"7px 13px",background:busy?"#444":"#1f6feb",color:"#fff",border:"none",borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
+                🖨 인쇄
+              </button>
+              <button onClick={onSavePdf} disabled={busy}
+                style={{padding:"7px 13px",background:busy?"#444":"#238636",color:"#fff",border:"none",borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
+                📥 PDF 저장
+              </button>
+              <button onClick={onSaveZip} disabled={busy}
+                style={{padding:"7px 13px",background:busy?"#444":C.purple,color:"#fff",border:"none",borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
+                📦 이미지 ZIP
+              </button>
+            </div>
+            <button onClick={onClose} disabled={busy}
+              style={{padding:"7px 13px",background:C.border2,color:C.text,border:"none",borderRadius:6,fontSize:12,cursor:"pointer",flexShrink:0,opacity:busy?0.6:1}}>
+              ✕ 닫기
+            </button>
+          </div>
+          <div style={{width:"100%",maxWidth:860,flex:1,minHeight:0,borderRadius:8,overflow:"hidden",background:"#fff",boxShadow:"0 8px 40px rgba(0,0,0,0.6)"}}>
+            <iframe srcDoc={html} style={{width:"100%",height:"100%",minHeight:"60vh",border:"none",display:"block"}} title="줄명찰 미리보기"/>
+          </div>
+          <div style={{fontSize:10,color:C.muted,textAlign:"center",lineHeight:1.8}}>
+            인쇄 설정: <strong style={{color:C.text}}>여백 없음 · 배율 100% · 배경 그래픽 포함</strong>
+          </div>
+        </div>
+      );
+    }
+
+    /* ── 시스템 폰트 목록 (오프라인 환경 폴백) ─────────────────────── */
+    const FALLBACK_FONTS = [
+      "Pretendard",
+      "맑은 고딕", "굴림", "굴림체", "돋움", "돋움체",
+      "바탕", "바탕체", "궁서", "궁서체",
+      "나눔고딕", "나눔고딕Bold", "나눔명조", "나눔바른고딕",
+      "HY견고딕", "HY그래픽", "HY신명조", "HY중고딕",
+      "Malgun Gothic", "Malgun Gothic Semilight",
+      "Arial", "Arial Black", "Calibri", "Cambria",
+      "Segoe UI", "Tahoma", "Times New Roman", "Verdana",
+    ];
+
+    function FontPicker({ value, onChange, systemFonts }) {
+      const fonts = systemFonts && systemFonts.length > 0 ? systemFonts : FALLBACK_FONTS;
+      return (
+        <div style={{display:"flex",alignItems:"center",gap:6}}>
+          <select
+            value={value}
+            onChange={e => onChange(e.target.value)}
+            style={{...inp, flex:1, fontSize:11, cursor:"pointer", padding:"5px 6px"}}
+          >
+            {fonts.map(f => (
+              <option key={f} value={f}>{f}</option>
+            ))}
+          </select>
+          <span style={{fontFamily:value, fontSize:13, color:C.text, flexShrink:0, minWidth:70, textAlign:"right"}}>가나다</span>
+        </div>
+      );
+    }
+
+    /* ══════════════════════════════════════════════════════════════════
+       메인 컴포넌트
+    ══════════════════════════════════════════════════════════════════ */
+    function LanyardTagSystem() {
+      // 크기
+      const [szIdx,   setSzIdx]   = useState(-1); // 직접 입력만 사용
+      const [customW, setCustomW] = useState("90");
+      const [customH, setCustomH] = useState("120");
+
+      // 이미지
+      const [bgImg,       setBgImg]       = useState(null);
+      const [logoImg,     setLogoImg]     = useState(null);
+      const [bgLoading,   setBgLoading]   = useState(false);
+      const [logoLoading, setLogoLoading] = useState(false);
+      const [bgOffset,    setBgOffset]    = useState({x:0,y:0});
+      const [bgScale,     setBgScale]     = useState(1.0);
+      const [logoOffset,  setLogoOffset]  = useState({x:0,y:0});
+      const [logoScale,   setLogoScale]   = useState(1.0);
+
+      // 디자인
+      const [border,    setBorder]    = useState({color:"#1e3a8a", thickness:3});
+      const [headerRatio, setHeaderRatio] = useState(0.19);
+      const [footerRatio, setFooterRatio] = useState(0.20);
+      const [eventName, setEventName] = useState("행사명");
+      const [textColor, setTextColor] = useState("#1a1a2e");
+      const [fontFamily,setFontFamily]= useState("Pretendard");
+      const [zones,     setZones]     = useState({
+        top:      {visible:true,  fontSize:16, ox:0, oy:0},
+        org:      {visible:true,  fontSize:14, ox:0, oy:0},
+        name:     {visible:true,  fontSize:28, ox:0, oy:0},
+        position: {visible:true,  fontSize:13, ox:0, oy:0},
+        field1:   {visible:false, fontSize:11, ox:0, oy:0},
+        field2:   {visible:false, fontSize:11, ox:0, oy:0},
+        logo:     {visible:true,  fontSize:14, ox:0, oy:0},
+      });
+
+      // 데이터
+      const [csvData,  setCsvData]  = useState([]);
+      const [headers,  setHeaders]  = useState([]);
+      const [colMap,   setColMap]   = useState({org:-1,position:-1,name:-1,field1:-1,field2:-1});
+      const [pidx,     setPidx]     = useState(0);
+      const [dataMode,   setDataMode]   = useState("file"); // "file" | "manual"
+      const [manualData, setManualData] = useState([]);
+      const [manualForm, setManualForm] = useState({org:"",name:"",position:"",field1:"",field2:""});
+      const [editIdx,    setEditIdx]    = useState(null);
+
+      // 시스템 폰트
+      const [systemFonts, setSystemFonts] = useState([]);
+
+      // 미리보기 확대
+      const [previewZoom, setPreviewZoom] = useState(0.5);
+
+      // 이미지 조정 패널 접기/펼치기 (기본: 닫힘)
+      const [bgCtrlOpen,     setBgCtrlOpen]     = useState(false);
+      const [logoCtrlOpen,   setLogoCtrlOpen]   = useState(false);
+      const [eventNameOpen,  setEventNameOpen]  = useState(false);
+      const [borderOpen,     setBorderOpen]     = useState(false);
+
+      // UI
+      const [tab,      setTab]      = useState("design");
+      const [printHtml,setPrintHtml]= useState(null);
+      const [busy,     setBusy]     = useState(false);
+      const [busyMsg,  setBusyMsg]  = useState("");
+      const [prog,     setProg]     = useState({cur:0,total:0});
+
+      // 모바일 반응형
+      const [isMobile, setIsMobile] = useState(() => window.innerWidth <= 768);
+      const [sidebarOpen, setSidebarOpen] = useState(false);
+
+      const canvasRef   = useRef(null);
+      const mainAreaRef = useRef(null);
+      const [containerSize, setContainerSize] = useState({w:900, h:800});
+      const isCustom = szIdx === -1;
+      const sz = isCustom
+        ? mkCustomSz(Math.max(30,parseInt(customW)||90), Math.max(40,parseInt(customH)||120))
+        : SIZES[szIdx] || SIZES[1];
+
+      // 현재 설정 객체
+      const cfg = {
+        baseW: sz.lw, baseH: sz.lh,
+        bgImg, bgOffset, bgScale,
+        logoImg, logoOffset, logoScale,
+        border, headerRatio, footerRatio,
+        eventName, textColor, fontFamily, zones,
+      };
+
+      // 통합 데이터 (파일/직접입력)
+      const effectiveData = dataMode === "manual"
+        ? manualData
+        : csvData.map(mapRow);
+
+      // 현재 미리보기 데이터
+      const previewData = effectiveData.length > 0 ? (effectiveData[pidx] || effectiveData[0]) : {};
+
+      // 배경 이미지에서 대표 색상 추출 → 테두리 색상 자동 설정
+      function detectBorderColor() {
+        if (!bgImg) return;
+        const size = 80;
+        const c = document.createElement('canvas');
+        c.width = size; c.height = size;
+        const ctx = c.getContext('2d');
+        ctx.drawImage(bgImg, 0, 0, size, size);
+        const data = ctx.getImageData(0, 0, size, size).data;
+        let r = 0, g = 0, b = 0, count = 0;
+        // 가장자리 픽셀만 샘플링
+        const edge = 8;
+        for (let y = 0; y < size; y++) {
+          for (let x = 0; x < size; x++) {
+            if (x < edge || x >= size - edge || y < edge || y >= size - edge) {
+              const i = (y * size + x) * 4;
+              r += data[i]; g += data[i+1]; b += data[i+2];
+              count++;
             }
-          };
+          }
+        }
+        r = Math.round(r / count * 0.6); // 어둡게
+        g = Math.round(g / count * 0.6);
+        b = Math.round(b / count * 0.6);
+        const hex = '#' + [r, g, b].map(v => Math.min(255, v).toString(16).padStart(2, '0')).join('');
+        setBorder(prev => ({ ...prev, color: hex }));
+      }
 
-          // ── 이미지 ZIP 다운로드 ──
-          const exportImagesZip = async () => {
-            if (!csvData.length) return;
-            setExporting(true);
-            try {
-              if (!window.JSZip) {
-                alert("JSZip 라이브러리를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.");
-                setExporting(false);
-                return;
-              }
-              const JSZip = window.JSZip;
-              const zip = new JSZip();
-              const folder = zip.folder("명찰_" + (eventName||"badge"));
-              const cfg = { baseW:sz.w, baseH:sz.h, bgImg, logoImg, border, eventName, textColor, zones, bgOffset, bgScale, logoOffset, logoScale };
-              const printW = Math.round(sz.ew * DPI_SCALE);
-              const printH = Math.round(sz.eh * DPI_SCALE);
-              
-              for (let i = 0; i < csvData.length; i++) {
-                setExpProg({ cur:i+1, total:csvData.length });
-                setExpMsg(`이미지 생성 중... (${i+1}/${csvData.length})`);
-                const cv = document.createElement("canvas");
-                cv.width = printW; cv.height = printH;
-                const data = getRowData(csvData[i]);
-                renderBadge(cv, {...cfg, fontFamily, topHeightRatio}, data);
-                const imgData = cv.toDataURL("image/jpeg", 0.85).split(",")[1];
-                folder.file(`${String(i+1).padStart(3,"0")}_${data.name||"unnamed"}.jpg`, imgData, {base64:true});
-                if (i % 3 === 2) await new Promise(r => setTimeout(r, 0));
-              }
-              
-              setExpMsg("ZIP 파일 생성 중...");
-              await new Promise(r => setTimeout(r, 100));
-              const blob = await folder.generateAsync({type:"blob"});
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement("a");
-              a.href = url;
-              a.download = `명찰_이미지_${eventName||"badge"}_${csvData.length}명.zip`;
-              document.body.appendChild(a);
-              a.click();
-              document.body.removeChild(a);
-              URL.revokeObjectURL(url);
-              setExporting(false); setExpMsg(""); setExpProg({ cur:0, total:0 });
-            } catch(err) {
-              console.error(err);
-              alert("ZIP 생성 오류: "+err.message);
-              setExporting(false); setExpMsg(""); setExpProg({ cur:0, total:0 });
+      function mapRow(row) {
+        if (!row) return {};
+        const get = i => (i >= 0 && row[i] != null ? String(row[i]) : "");
+        return {
+          org:      get(colMap.org),
+          position: get(colMap.position),
+          name:     get(colMap.name),
+          field1:   get(colMap.field1),
+          field2:   get(colMap.field2),
+        };
+      }
+
+      // 캔버스 렌더 (모든 state 변화에 즉시 반영 — 출력과 동일한 해상도 사용)
+      useLayoutEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        renderTag(canvas, cfg, previewData);
+      });
+
+      // 시스템 폰트 로드 (queryLocalFonts API - Electron/Chromium 지원)
+      useEffect(() => {
+        async function loadSystemFonts() {
+          if (!('queryLocalFonts' in window)) return;
+          try {
+            const fonts = await window.queryLocalFonts();
+            const families = [...new Set(fonts.map(f => f.family))].sort((a, b) => {
+              // 한글 폰트 우선 정렬
+              const aKo = /[가-힣]/.test(a);
+              const bKo = /[가-힣]/.test(b);
+              if (aKo && !bKo) return -1;
+              if (!aKo && bKo) return 1;
+              return a.localeCompare(b);
+            });
+            setSystemFonts(families);
+          } catch(e) {
+            // 권한 거부 또는 미지원 → FALLBACK_FONTS 사용
+            console.log('queryLocalFonts:', e.message);
+          }
+        }
+        loadSystemFonts();
+      }, []);
+
+      // 오른쪽 미리보기 영역 크기 추적
+      useEffect(() => {
+        const el = mainAreaRef.current;
+        if (!el) return;
+        const obs = new ResizeObserver(([entry]) => {
+          const { width, height } = entry.contentRect;
+          setContainerSize({ w: Math.floor(width), h: Math.floor(height) });
+        });
+        obs.observe(el);
+        return () => obs.disconnect();
+      }, []);
+
+      // 모바일 감지 (resize 대응)
+      useEffect(() => {
+        const check = () => setIsMobile(window.innerWidth <= 768);
+        window.addEventListener('resize', check);
+        return () => window.removeEventListener('resize', check);
+      }, []);
+
+      // 배경 이미지 업로드
+      async function handleBgUpload(file) {
+        setBgLoading(true);
+        try { const img = await fileToImage(file); setBgImg(img); } catch(e) { alert("배경 이미지 오류: " + e.message); }
+        setBgLoading(false);
+      }
+
+      // 로고 업로드
+      async function handleLogoUpload(file) {
+        setLogoLoading(true);
+        try { const img = await fileToImage(file); setLogoImg(img); } catch(e) { alert("로고 이미지 오류: " + e.message); }
+        setLogoLoading(false);
+      }
+
+      // CSV/엑셀 업로드
+      function handleDataUpload(file) {
+        const reader = new FileReader();
+        const isExcel = file.name.match(/\.(xlsx|xls)$/i);
+        reader.onload = e => {
+          try {
+            let rows = [];
+            if (isExcel) {
+              const wb = XLSX.read(new Uint8Array(e.target.result), {type:'array'});
+              const ws = wb.Sheets[wb.SheetNames[0]];
+              rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:""});
+            } else {
+              const text = e.target.result;
+              rows = text.trim().split(/\r?\n/).map(l => l.split(',').map(v => v.replace(/^"|"$/g,'')));
             }
-          };
+            if (rows.length < 2) { alert("데이터가 없습니다. (헤더 포함 2행 이상 필요)"); return; }
+            const hdrs = rows[0].map(String);
+            const data = rows.slice(1).filter(r => r.some(v => String(v).trim()));
+            setHeaders(hdrs);
+            setCsvData(data);
+            setPidx(0);
 
-          const layout=calcLayout(sz);
-          const dScale=Math.min(1, 500/sz.h, 360/sz.w);
-          const dW=Math.round(sz.w*dScale), dH=Math.round(sz.h*dScale);
-          const upZ=(k,v)=>setZones(p=>({...p,[k]:v}));
+            // 자동 컬럼 매핑
+            const guess = (keys) => { for(const k of keys){ const i=hdrs.findIndex(h=>h.includes(k)); if(i>=0)return i; } return -1; };
+            setColMap({
+              org:      guess(["소속","기관","회사","조직","단체","org","company"]),
+              position: guess(["직위","직책","직급","역할","pos","title","role"]),
+              name:     guess(["이름","성명","name","성함"]),
+              field1:   guess(["추가 1","추가1","부서","팀","field1","dept"]),
+              field2:   guess(["추가 2","추가2","지역","field2","region"]),
+            });
+            setTab("data");
+          } catch(err) { alert("파일 오류: " + err.message); }
+        };
+        if (isExcel) reader.readAsArrayBuffer(file);
+        else reader.readAsText(file, 'UTF-8');
+      }
 
-          return (
-            <>
-            <PdfPreviewModal preview={pdfPreview} onClose={()=>setPdfPreview(null)} onExportPDF={exportPDFDirect} onExportZip={exportImagesZip} exporting={exporting} expMsg={expMsg} expProg={expProg}/>
-            <div style={{display:"flex",height:"100vh",fontFamily:"Pretendard,sans-serif",background:C.bg,color:C.text,overflow:"hidden"}}>
+      // 미리보기/인쇄 공통 준비
+      async function prepareHtml() {
+        const dataList = effectiveData.length > 0
+          ? effectiveData
+          : [previewData.name || previewData.org ? previewData : {org:"○○기업",name:"홍길동",position:"대표이사",field1:"",field2:""}];
+        setBusy(true); setBusyMsg("명찰 생성 중..."); setProg({cur:0,total:dataList.length});
+        const html = await buildPrintHtml(sz, cfg, dataList, (cur,total) => setProg({cur,total}));
+        setBusy(false); setBusyMsg(""); setProg({cur:0,total:0});
+        return html;
+      }
 
-              <div style={{width:305,background:C.surface,borderRight:`1px solid ${C.border}`,display:"flex",flexDirection:"column",flexShrink:0}}>
-                <div style={{padding:"15px 16px 11px",borderBottom:`1px solid ${C.border}`}}>
-                  <div style={{fontSize:9.5,fontWeight:700,letterSpacing:"0.16em",color:C.blue,textTransform:"uppercase"}}>NameTag System</div>
-                  <div style={{fontSize:16,fontWeight:700,color:"#f0f6fc",marginTop:2}}>명찰 출력 시스템</div>
-                </div>
-                <div style={{display:"flex",borderBottom:`1px solid ${C.border}`}}>
-                  {[["design","🎨 디자인"],["data","📋 데이터"],["export","📄 출력"]].map(([k,l])=>(
-                    <button key={k} onClick={()=>setTab(k)} style={{flex:1,padding:"9px 0",fontSize:11,fontWeight:600,border:"none",background:tab===k?C.bg:"transparent",color:tab===k?C.blue:C.muted,borderBottom:`2px solid ${tab===k?C.blue:"transparent"}`,cursor:"pointer"}}>{l}</button>
-                  ))}
-                </div>
+      // 미리보기 열기
+      async function handlePreview() {
+        const html = await prepareHtml();
+        setPrintHtml(html);
+      }
 
-                <div style={{flex:1,overflowY:"auto",padding:14}}>
+      // 인쇄 (Electron IPC 또는 팝업 폴백)
+      async function handlePrint() {
+        if (!printHtml) return;
+        if (window.electronAPI) {
+          setBusy(true); setBusyMsg("인쇄 다이얼로그 열기...");
+          const result = await window.electronAPI.printHtml(printHtml);
+          setBusy(false); setBusyMsg("");
+          if (!result.success && result.reason !== 'cancelled') {
+            alert("인쇄 오류: " + result.reason);
+          }
+        } else {
+          // 브라우저 폴백
+          const pw = window.open('about:blank', '_blank', 'width=900,height=1200');
+          if (!pw) { alert("팝업이 차단되었습니다."); return; }
+          pw.document.open('text/html','replace');
+          pw.document.write(printHtml);
+          pw.document.close();
+          setTimeout(() => { pw.focus(); pw.print(); }, 1000);
+        }
+      }
 
-                  {tab==="design"&&(<>
-                    <Sec title="명찰 사이즈">
-                      <div style={{background:"#0f0620",border:`1px solid ${C.purple}`,borderRadius:7,padding:"12px 12px 10px"}}>
-                        <div style={{fontSize:10,color:"#c4b5fd",fontWeight:700,marginBottom:10,letterSpacing:"0.05em"}}>✏️ 사이즈 직접 입력 (mm)</div>
-                        <div style={{display:"flex",alignItems:"center",gap:8}}>
-                          <div style={{flex:1}}>
-                            <div style={{fontSize:10,color:C.muted,marginBottom:4}}>가로 (width)</div>
-                            <div style={{display:"flex",alignItems:"center",gap:5}}>
-                              <input type="number" min="10" max="400" value={customW}
-                                onChange={e=>setCustomW(e.target.value)}
-                                onBlur={e=>{const v=Math.min(400,Math.max(10,parseFloat(e.target.value)||10));setCustomW(String(v));}}
-                                style={{...{background:"#0d1117",border:`1px solid ${C.purple}`,borderRadius:4,color:"#c4b5fd",padding:"6px 8px",fontSize:13,fontWeight:700,width:"100%",outline:"none",textAlign:"center"}}}
-                              />
-                              <span style={{fontSize:11,color:C.muted,flexShrink:0}}>mm</span>
-                            </div>
-                          </div>
-                          <div style={{fontSize:18,color:C.dim,paddingTop:18}}>×</div>
-                          <div style={{flex:1}}>
-                            <div style={{fontSize:10,color:C.muted,marginBottom:4}}>세로 (height)</div>
-                            <div style={{display:"flex",alignItems:"center",gap:5}}>
-                              <input type="number" min="10" max="400" value={customH}
-                                onChange={e=>setCustomH(e.target.value)}
-                                onBlur={e=>{const v=Math.min(400,Math.max(10,parseFloat(e.target.value)||10));setCustomH(String(v));}}
-                                style={{...{background:"#0d1117",border:`1px solid ${C.purple}`,borderRadius:4,color:"#c4b5fd",padding:"6px 8px",fontSize:13,fontWeight:700,width:"100%",outline:"none",textAlign:"center"}}}
-                              />
-                              <span style={{fontSize:11,color:C.muted,flexShrink:0}}>mm</span>
-                            </div>
-                          </div>
-                        </div>
-                        <div style={{marginTop:10,padding:"7px 10px",background:"#0d1117",borderRadius:5,border:`1px solid ${C.border}`}}>
-                          <div style={{display:"flex",justifyContent:"space-between",fontSize:10}}>
-                            <span style={{color:C.muted}}>출력 해상도 (300dpi)</span>
-                            <span style={{color:"#c4b5fd",fontWeight:700,fontFamily:"monospace"}}>
-                              {Math.round(customW*MM)} × {Math.round(customH*MM)} px
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-                    </Sec>
+      // PDF 저장 [웹 버전] Electron savePdf → 인쇄 창(브라우저 "PDF로 저장") 으로 대체
+      async function handleSavePdf() {
+        const html = printHtml || await prepareHtml();
+        if (!html) return;
+        const pw = window.open('about:blank', '_blank', 'width=900,height=1200');
+        if (!pw) { alert("팝업이 차단되었습니다.\n브라우저 주소창 옆 팝업 허용 버튼을 눌러주세요."); return; }
+        pw.document.open('text/html', 'replace');
+        pw.document.write(html);
+        pw.document.close();
+        // 렌더 완료 후 인쇄 다이얼로그 → "PDF로 저장" 선택
+        setTimeout(() => { pw.focus(); pw.print(); }, 1000);
+      }
 
-                    <Sec title="배경 / 로고 이미지">
-                      <ImgUploadBtn id="bg-up"   label="배경 이미지 업로드" accept="image/*" onChange={handleBgFile}   hasImage={!!bgImg}   loading={bgLoading}/>
-                      <ImgUploadBtn id="logo-up" label="로고 이미지 업로드" accept="image/*" onChange={handleLogoFile} hasImage={!!logoImg} loading={logoLoading}/>
-                    </Sec>
+      // 이미지 ZIP 내보내기
+      async function handleSaveZip() {
+        const dataList = effectiveData.length > 0
+          ? effectiveData
+          : [{org:"○○기업",name:"홍길동",position:"대표이사",field1:"",field2:""}];
+        setBusy(true); setBusyMsg("이미지 생성 중..."); setProg({cur:0,total:dataList.length});
+        const zip = new JSZip();
+        for (let i = 0; i < dataList.length; i++) {
+          setProg({cur:i+1,total:dataList.length});
+          const c = document.createElement('canvas');
+          c.width = sz.ew; c.height = sz.eh;
+          renderTag(c, cfg, dataList[i]);
+          const base64 = c.toDataURL('image/png').split(',')[1];
+          const fname = `tag_${String(i+1).padStart(3,'0')}_${(dataList[i].name||'unnamed').replace(/[\\/:*?"<>|]/g,'')}.png`;
+          zip.file(fname, base64, {base64:true});
+          await new Promise(r => setTimeout(r, 0));
+        }
+        const arrayBuffer = await zip.generateAsync({type:'arraybuffer'});
+        const defaultName = (eventName || '줄명찰') + '_이미지.zip';
+        // [웹 버전] Electron showSaveDialog + saveFile → Blob 다운로드로 대체
+        const blob = new Blob([arrayBuffer], {type: 'application/zip'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = defaultName;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        setBusy(false); setBusyMsg(""); setProg({cur:0,total:0});
+      }
 
-                    {bgImg && (
-                      <Sec title="🖼 배경 이미지 조정" accent={C.green}>
-                        <Row label="X 위치"><Slider min={-100} max={100} value={bgOffset.x} onChange={v=>setBgOffset({...bgOffset,x:v})} unit="px"/></Row>
-                        <Row label="Y 위치"><Slider min={-100} max={100} value={bgOffset.y} onChange={v=>setBgOffset({...bgOffset,y:v})} unit="px"/></Row>
-                        <Row label="크기"><Slider min={0.5} max={2.0} step={0.1} value={bgScale} onChange={v=>setBgScale(v)} unit="배"/></Row>
-                        <button onClick={()=>{setBgOffset({x:0,y:0});setBgScale(1.0);}} style={{width:"100%",padding:"6px",background:C.border2,border:"none",color:C.text,borderRadius:4,fontSize:10,cursor:"pointer",marginTop:8}}>🔄 초기화</button>
-                      </Sec>
-                    )}
+      /* ── 미리보기 CSS 표시 크기 계산 ──────────────────────────────────
+         캔버스 내부 해상도는 출력과 동일한 sz.ew × sz.eh 고정.
+         CSS width/height 만으로 화면에 맞게 축소 → 미리보기 = 출력과 100% 동일.
+      ─────────────────────────────────────────────────────────────── */
+      const BOTTOM_BAR_H = isMobile ? 52 : 62;
+      // 패널 안에 항상 온전히 보이도록 zoom 상한 계산
+      const PAD = 32, SLIDER_H = 40;
+      const maxFitZoom = Math.max(0.3, Math.min(
+        (containerSize.w - PAD * 2) / sz.lw,
+        (containerSize.h - BOTTOM_BAR_H - SLIDER_H - PAD * 2) / sz.lh
+      ));
+      // 슬라이더 값이 maxFitZoom 초과하면 캔버스를 패널 크기에 맞게 자동 클램프
+      const effectiveZoom = Math.min(previewZoom, maxFitZoom);
+      const dispW = Math.round(sz.lw * effectiveZoom);
+      const dispH = Math.round(sz.lh * effectiveZoom);
 
-                    {logoImg && (
-                      <Sec title="🎯 로고 이미지 조정" accent={C.purple}>
-                        <Row label="X 위치"><Slider min={-100} max={100} value={logoOffset.x} onChange={v=>setLogoOffset({...logoOffset,x:v})} unit="px"/></Row>
-                        <Row label="Y 위치"><Slider min={-100} max={100} value={logoOffset.y} onChange={v=>setLogoOffset({...logoOffset,y:v})} unit="px"/></Row>
-                        <Row label="크기"><Slider min={0.5} max={2.0} step={0.1} value={logoScale} onChange={v=>setLogoScale(v)} unit="배"/></Row>
-                        <button onClick={()=>{setLogoOffset({x:0,y:0});setLogoScale(1.0);}} style={{width:"100%",padding:"6px",background:C.border2,border:"none",color:C.text,borderRadius:4,fontSize:10,cursor:"pointer",marginTop:8}}>🔄 초기화</button>
-                      </Sec>
-                    )}
+      /* ── 렌더 ─────────────────────────────────────────────────────── */
+      return (
+        <div style={{display:"flex",flexDirection:"column",height:"100vh",overflow:"hidden"}}>
+          {/* 헤더 */}
+          <div style={{height:44,background:C.surface,borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",padding:"0 12px",gap:8,flexShrink:0}}>
+            {/* 모바일: 사이드바 열기 버튼 */}
+            {isMobile && (
+              <button onClick={() => setSidebarOpen(v => !v)}
+                style={{padding:"5px 9px",background:"transparent",border:`1px solid ${C.border2}`,borderRadius:5,color:C.text,fontSize:16,cursor:"pointer",flexShrink:0,lineHeight:1}}>
+                ☰
+              </button>
+            )}
+            <span style={{fontSize:isMobile?12:14,fontWeight:700,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+              {isMobile ? "명찰 출력" : "명찰/명패 출력 시스템"}
+            </span>
+            <div style={{flex:1}}/>
+            {effectiveData.length > 0 && (
+              <span style={{fontSize:10,color:C.green,fontWeight:600,flexShrink:0}}>
+                ✓ {effectiveData.length}명
+              </span>
+            )}
+            <button onClick={handlePreview} disabled={busy}
+              style={{padding:isMobile?"5px 10px":"6px 14px",background:busy?"#444":C.accent,color:"#fff",border:"none",borderRadius:6,fontSize:isMobile?11:12,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1,flexShrink:0}}>
+              {busy ? (isMobile ? "처리중…" : busyMsg) : (isMobile ? "👁 미리보기" : "👁 미리보기 / 인쇄")}
+            </button>
+          </div>
 
-                    <Sec title="테두리 설정">
-                      <Row label="색상">
-                        <input type="color" value={border.color} onChange={e=>{setBorder(p=>({...p,color:e.target.value}));setAutoColor(false);}} style={{width:30,height:24,borderRadius:4}}/>
-                        <span style={{fontSize:10,color:C.muted,fontFamily:"monospace"}}>{border.color}</span>
-                      </Row>
-                      <Row label="자동감지"><span style={{fontSize:11,color:C.muted}}>배경 색 자동 인식</span><Toggle on={autoColor} onChange={setAutoColor}/></Row>
-                      <Row label="두께"><Slider min={0} max={24} value={border.thickness} onChange={v=>setBorder(p=>({...p,thickness:v}))} unit="px"/></Row>
-                    </Sec>
+          <div style={{display:"flex",flex:1,overflow:"hidden"}}>
+            {/* 모바일 백드롭 */}
+            {isMobile && sidebarOpen && (
+              <div onClick={() => setSidebarOpen(false)}
+                style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.65)",zIndex:999}}/>
+            )}
 
-                    <Sec title="글자 설정">
-                      <Row label="색상">
-                        <input type="color" value={textColor} onChange={e=>setTextColor(e.target.value)} style={{width:30,height:24,borderRadius:4}}/>
-                        <span style={{fontSize:10,color:C.muted,fontFamily:"monospace"}}>{textColor}</span>
-                      </Row>
-                      <Row label="폰트">
-                        <select value={fontFamily} onChange={e=>setFontFamily(e.target.value)} style={{...baseInp,padding:"5px 7px",fontSize:11}}>
-                          <option value="Pretendard">Pretendard</option>
-                          <option value="Noto Sans KR">Noto Sans KR</option>
-                          <option value="Arial">Arial</option>
-                          <option value="Georgia">Georgia</option>
-                          <option value="Times New Roman">Times New Roman</option>
-                          <option value="Courier New">Courier New</option>
-                        </select>
-                      </Row>
-                    </Sec>
-
-                    <Sec title="행사명 (상단)" accent={C.blue}>
-                      <input value={eventName} onChange={e=>setEventName(e.target.value)} placeholder="행사명 입력..." style={{...baseInp,marginBottom:8}}/>
-                      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
-                        <span style={{fontSize:11,color:C.muted,width:60,flexShrink:0}}>영역 높이</span>
-                        <Slider min={0.15} max={0.45} value={topHeightRatio} onChange={v=>setTopHeightRatio(v)} unit=""/>
-                      </div>
-                      <ZoneCard title="행사명" zone={zones.top} onChange={v=>upZ("top",v)} fsRange={[8,120]}/>
-                    </Sec>
-                    <Sec title="중단 구역" accent={C.green}>
-                      <ZoneCard title="소속 / 업체명" zone={zones.org}      onChange={v=>upZ("org",v)}/>
-                      <ZoneCard title="직위 / 직급"   zone={zones.position} onChange={v=>upZ("position",v)}/>
-                      <ZoneCard title="이름"          zone={zones.name}     onChange={v=>upZ("name",v)} fsRange={[10,80]}/>
-                      <ZoneCard title="추가 필드 1"   zone={zones.field1}   onChange={v=>upZ("field1",v)}/>
-                      <ZoneCard title="추가 필드 2"   zone={zones.field2}   onChange={v=>upZ("field2",v)}/>
-                    </Sec>
-                    <Sec title="로고 위치 (하단)" accent={C.orange}>
-                      <ZoneCard title="로고" zone={zones.logo} onChange={v=>upZ("logo",v)} showFontSize={false}/>
-                    </Sec>
-                  </>)}
-
-                  {tab==="data"&&(<>
-                    <Sec title="데이터 파일 업로드">
-                      <p style={{fontSize:11,color:C.muted,lineHeight:1.7,marginBottom:10}}>엑셀(.xlsx) 또는 CSV 파일을 업로드하세요.<br/><strong style={{color:C.text}}>첫 번째 행은 헤더</strong>로 인식됩니다.</p>
-                      <label htmlFor="csv-up" style={{display:"flex",alignItems:"center",gap:8,padding:"8px 11px",background:C.bg,border:`1px dashed ${csvData.length>0?"#238636":C.border2}`,borderRadius:6,cursor:"pointer",marginBottom:6}}>
-                        <span style={{fontSize:15}}>{csvData.length>0?"✓":"↑"}</span>
-                        <span style={{fontSize:12,color:csvData.length>0?C.green:C.muted}}>엑셀 / CSV 업로드</span>
-                        <input id="csv-up" type="file" accept=".xlsx,.xls,.csv" onChange={handleCsv} style={{display:"none"}}/>
-                      </label>
-                      {csvData.length>0
-                        ?<div style={{fontSize:11,color:C.green,padding:"6px 10px",background:"#0d2318",borderRadius:4,border:"1px solid #238636"}}>✓ {csvData.length}건 로드 완료</div>
-                        :<SampleCsvBox/>
-                      }
-                    </Sec>
-                    {headers.length>0&&(
-                      <Sec title="열 매핑">
-                        {[["org","소속 / 업체명"],["position","직위 / 직급"],["name","이름"],["field1","추가 필드 1"],["field2","추가 필드 2"]].map(([k,lbl])=>(
-                          <div key={k} style={{marginBottom:9}}>
-                            <div style={{fontSize:11,color:C.muted,marginBottom:3}}>{lbl}</div>
-                            <select value={colMap[k]} onChange={e=>setColMap(p=>({...p,[k]:+e.target.value}))} style={{...baseInp,padding:"5px 7px",fontSize:11}}>
-                              <option value={-1}>— 사용 안함</option>
-                              {headers.map((h,i)=><option key={i} value={i}>{h}</option>)}
-                            </select>
-                          </div>
-                        ))}
-                      </Sec>
-                    )}
-                    {csvData.length>0&&(
-                      <Sec title="데이터 탐색">
-                        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
-                          <button onClick={()=>setPidx(v=>Math.max(0,v-1))} disabled={pidx===0} style={{padding:"5px 10px",background:pidx===0?C.surface:C.border2,color:pidx===0?C.dim:C.text,border:`1px solid ${C.border}`,borderRadius:4,cursor:pidx===0?"not-allowed":"pointer"}}>◀</button>
-                          <span style={{flex:1,textAlign:"center",fontSize:12,color:C.muted}}>{pidx+1} / {csvData.length}명</span>
-                          <button onClick={()=>setPidx(v=>Math.min(csvData.length-1,v+1))} disabled={pidx===csvData.length-1} style={{padding:"5px 10px",background:pidx===csvData.length-1?C.surface:C.border2,color:pidx===csvData.length-1?C.dim:C.text,border:`1px solid ${C.border}`,borderRadius:4,cursor:pidx===csvData.length-1?"not-allowed":"pointer"}}>▶</button>
-                        </div>
-                        <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:10,maxHeight:200,overflowY:"auto"}}>
-                          {headers.map((h,i)=>(
-                            <div key={i} style={{display:"flex",gap:8,paddingBottom:5,borderBottom:`1px solid ${C.border}`,marginBottom:5}}>
-                              <span style={{fontSize:10,color:C.dim,width:65,flexShrink:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{h}</span>
-                              <span style={{fontSize:11,color:C.text}}>{String(csvData[pidx]?.[i]??"")}</span>
-                            </div>
-                          ))}
-                        </div>
-                      </Sec>
-                    )}
-                  </>)}
-
-                  {tab==="export"&&(<>
-                    <Sec title="A4 레이아웃">
-                      <A4Preview sz={sz} total={csvData.length}/>
-                      <div style={{marginTop:10,background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"10px 12px"}}>
-                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"6px 12px",fontSize:11}}>
-                          {[["출력 용지","A4 (210×297mm)"],["명찰 사이즈",sz.sub],["페이지당",`${layout.cols}×${layout.rows}=${layout.perPage}매`],["총 페이지",csvData.length>0?`${Math.ceil(csvData.length/layout.perPage)}p`:"-"],["해상도","300 dpi"],["형식","PDF"]].map(([l,v])=>(
-                            <div key={l}><div style={{fontSize:9,color:C.dim,marginBottom:1}}>{l}</div><div style={{fontWeight:700,color:C.text}}>{v}</div></div>
-                          ))}
-                        </div>
-                      </div>
-                    </Sec>
-                    <Sec title="단일 PNG 저장">
-                      <button onClick={exportOne} style={{width:"100%",padding:"8px",background:C.accent,color:"#fff",border:"none",borderRadius:6,fontSize:12,fontWeight:600,cursor:"pointer"}}>📥 현재 미리보기 PNG 저장</button>
-                    </Sec>
-                    <Sec title="대량 출력 — A4 PDF">
-                      {csvData.length===0
-                        ?<div style={{padding:12,background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,fontSize:11,color:C.muted,lineHeight:1.7}}>📋 데이터 탭에서 CSV / 엑셀 파일을<br/>먼저 업로드해 주세요.</div>
-                        :(<>
-                          <div style={{fontSize:12,color:C.text,marginBottom:10}}>총 <span style={{color:C.green,fontWeight:700}}>{csvData.length}명</span> → <span style={{color:C.orange,fontWeight:700}}>A4 {Math.ceil(csvData.length/layout.perPage)}페이지</span> PDF</div>
-                          {exporting&&(<div style={{marginBottom:12}}>
-                            <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:C.muted,marginBottom:5}}><span>{expMsg}</span><span>{expProg.cur}/{expProg.total}</span></div>
-                            <div style={{height:6,background:C.border2,borderRadius:3}}><div style={{height:6,background:`linear-gradient(90deg,${C.blue},${C.green})`,borderRadius:3,width:`${(expProg.cur/expProg.total)*100}%`,transition:"width .2s"}}/></div>
-                          </div>)}
-                          <button onClick={exportPDF} disabled={exporting} style={{width:"100%",padding:"10px",background:exporting?C.border:"#238636",color:exporting?C.dim:"#fff",border:"none",borderRadius:6,fontSize:13,fontWeight:700,cursor:exporting?"not-allowed":"pointer"}}>
-                            {exporting?`처리 중... (${expProg.cur}/${expProg.total}명)`:`📄 A4 PDF 생성 — 전체 ${csvData.length}명`}
-                          </button>
-                          <p style={{fontSize:10,color:C.muted,marginTop:8,lineHeight:1.6}}>인쇄 시 <strong style={{color:C.text}}>실제 크기(100%)</strong>로 설정하세요.</p>
-                        </>)
-                      }
-                    </Sec>
-                  </>)}
-
-                </div>
+            {/* 사이드바 (모바일: 슬라이드 드로어, 데스크탑: 고정 패널) */}
+            <div style={isMobile ? {
+              position:"fixed", top:0, left:0, bottom:0,
+              width:"min(290px, 88vw)",
+              background:C.surface, borderRight:`1px solid ${C.border}`,
+              display:"flex", flexDirection:"column", overflow:"hidden",
+              zIndex:1000,
+              transform: sidebarOpen ? "translateX(0)" : "translateX(-100%)",
+              transition:"transform 0.25s cubic-bezier(.4,0,.2,1)",
+            } : {
+              width:290, background:C.surface, borderRight:`1px solid ${C.border}`,
+              display:"flex", flexDirection:"column", flexShrink:0, overflow:"hidden",
+            }}>
+              {/* 탭 */}
+              <div style={{display:"flex",borderBottom:`1px solid ${C.border}`,flexShrink:0}}>
+                {isMobile && (
+                  <button onClick={() => setSidebarOpen(false)}
+                    style={{padding:"9px 13px",background:"transparent",border:"none",borderRight:`1px solid ${C.border}`,color:C.muted,fontSize:15,cursor:"pointer",flexShrink:0}}>
+                    ✕
+                  </button>
+                )}
+                {["design","data"].map(t => (
+                  <button key={t} onClick={() => setTab(t)}
+                    style={{flex:1,padding:"9px 0",background:tab===t?C.bg:"transparent",border:"none",color:tab===t?C.text:C.muted,fontSize:12,fontWeight:tab===t?700:400,cursor:"pointer",borderBottom:`2px solid ${tab===t?C.blue:"transparent"}`}}>
+                    {t==="design"?"✏ 디자인":"📋 데이터"}
+                  </button>
+                ))}
+                {/* 모바일: 미리보기 바로가기 탭 */}
+                {isMobile && (
+                  <button onClick={() => setSidebarOpen(false)}
+                    style={{flex:1,padding:"9px 0",background:"transparent",border:"none",color:C.muted,fontSize:12,fontWeight:400,cursor:"pointer",borderBottom:`2px solid transparent`}}>
+                    👁 미리보기
+                  </button>
+                )}
               </div>
 
-              <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14,padding:24,overflow:"hidden",background:"radial-gradient(ellipse at 60% 40%, #161b22 0%, #0d1117 75%)"}}>
-                <div style={{display:"flex",alignItems:"center",gap:10}}>
-                  <span style={{fontSize:10,padding:"3px 10px",background:"#0d2137",border:"1px solid #388bfd",borderRadius:10,color:C.blue,fontWeight:700}}>{sz.label}</span>
-                  <span style={{fontSize:10,color:C.muted}}>{sz.sub}</span>
-                  <span style={{fontSize:10,color:C.dim}}>· {sz.ew}×{sz.eh}px · 300dpi</span>
-                </div>
+              <div style={{flex:1,overflowY:"auto",padding:"14px 14px 20px"}}>
+                {tab === "design" && (
+                  <>
+                    {/* 크기 */}
+                    <Sec title="명찰 크기 (mm)">
+                      <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                        <input type="number" value={customW} onChange={e=>setCustomW(e.target.value)} min={30} max={300} style={{...inp,width:70,textAlign:"center"}} placeholder="가로"/>
+                        <span style={{color:C.dim,flexShrink:0}}>×</span>
+                        <input type="number" value={customH} onChange={e=>setCustomH(e.target.value)} min={40} max={400} style={{...inp,width:70,textAlign:"center"}} placeholder="세로"/>
+                        <span style={{fontSize:11,color:C.muted,flexShrink:0}}>mm</span>
+                      </div>
+                    </Sec>
 
-                <div style={{boxShadow:"0 4px 6px rgba(0,0,0,.3),0 20px 60px rgba(0,0,0,.6)",borderRadius:2,overflow:"hidden",width:dW,height:dH,flexShrink:0}}>
-                  <canvas ref={canvasRef} style={{display:"block",width:dW,height:dH}}/>
-                </div>
+                    {/* 배경 이미지 */}
+                    <Sec title="배경 이미지">
+                      <ImgUploadBtn id="bg-upload" label="배경 이미지 업로드" accept="image/*"
+                        onChange={handleBgUpload} hasImage={!!bgImg} loading={bgLoading}/>
+                      {bgImg && <>
+                        <div onClick={() => setBgCtrlOpen(v => !v)}
+                          style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer",padding:"4px 0",marginBottom:4,userSelect:"none"}}>
+                          <span style={{fontSize:11,color:C.muted,fontWeight:600}}>크기 / 위치 조정</span>
+                          <span style={{fontSize:11,color:C.dim}}>{bgCtrlOpen ? "▲" : "▼"}</span>
+                        </div>
+                        {bgCtrlOpen && <>
+                          <Row label="크기">
+                            <Slider min={0.1} max={5.0} step={0.05} value={bgScale} onChange={setBgScale}/>
+                          </Row>
+                          <PosControl ox={bgOffset.x} oy={bgOffset.y} onChange={(x,y)=>setBgOffset({x,y})}/>
+                        </>}
+                        <button onClick={() => { setBgImg(null); setBgOffset({x:0,y:0}); setBgScale(1.0); }}
+                          style={{marginTop:6,width:"100%",padding:"5px",background:"#2d1515",color:C.red,border:`1px solid #4a1515`,borderRadius:5,fontSize:11,cursor:"pointer"}}>
+                          ✕ 배경 제거
+                        </button>
+                      </>}
+                    </Sec>
 
-                {csvData.length>0&&(
-                  <div style={{display:"flex",alignItems:"center",gap:10}}>
-                    <button onClick={()=>setPidx(v=>Math.max(0,v-1))} disabled={pidx===0} style={{padding:"5px 12px",background:pidx===0?C.surface:C.border2,color:pidx===0?C.dim:C.text,border:`1px solid ${C.border}`,borderRadius:4,cursor:pidx===0?"not-allowed":"pointer"}}>◀</button>
-                    <span style={{fontSize:12,color:C.muted,minWidth:80,textAlign:"center"}}>{pidx+1} / {csvData.length}명</span>
-                    <button onClick={()=>setPidx(v=>Math.min(csvData.length-1,v+1))} disabled={pidx===csvData.length-1} style={{padding:"5px 12px",background:pidx===csvData.length-1?C.surface:C.border2,color:pidx===csvData.length-1?C.dim:C.text,border:`1px solid ${C.border}`,borderRadius:4,cursor:pidx===csvData.length-1?"not-allowed":"pointer"}}>▶</button>
-                  </div>
+                    {/* 로고 */}
+                    <Sec title="로고">
+                      <ImgUploadBtn id="logo-upload" label="로고 이미지 업로드" accept="image/*"
+                        onChange={handleLogoUpload} hasImage={!!logoImg} loading={logoLoading}/>
+                      {logoImg && <>
+                        <div onClick={() => setLogoCtrlOpen(v => !v)}
+                          style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer",padding:"4px 0",marginBottom:4,userSelect:"none"}}>
+                          <span style={{fontSize:11,color:C.muted,fontWeight:600}}>크기 / 위치 조정</span>
+                          <span style={{fontSize:11,color:C.dim}}>{logoCtrlOpen ? "▲" : "▼"}</span>
+                        </div>
+                        {logoCtrlOpen && <>
+                          <Row label="크기">
+                            <Slider min={0.3} max={2.5} step={0.05} value={logoScale} onChange={setLogoScale}/>
+                          </Row>
+                          <ZoneCard title="로고 위치" zone={zones.logo} onChange={z=>setZones(v=>({...v,logo:z}))} fsRange={[6,100]}/>
+                        </>}
+                        <button onClick={() => { setLogoImg(null); setLogoOffset({x:0,y:0}); setLogoScale(1.0); }}
+                          style={{marginTop:6,width:"100%",padding:"5px",background:"#2d1515",color:C.red,border:`1px solid #4a1515`,borderRadius:5,fontSize:11,cursor:"pointer"}}>
+                          ✕ 로고 제거
+                        </button>
+                      </>}
+                    </Sec>
+
+
+                    {/* 행사명 */}
+                    <Sec title={
+                      <div onClick={() => setEventNameOpen(v => !v)}
+                        style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer",userSelect:"none"}}>
+                        <span>상단 행사명</span>
+                        <span style={{fontSize:10,color:C.dim,fontWeight:400}}>{eventNameOpen ? "▲" : "▼"}</span>
+                      </div>
+                    }>
+                      {eventNameOpen && <>
+                        <input value={eventName} onChange={e=>setEventName(e.target.value)}
+                          placeholder="행사명 (빈 칸이면 숨김)"
+                          style={{...inp,marginBottom:6}}/>
+                        <ZoneCard title="행사명 텍스트" zone={zones.top} onChange={z=>setZones(v=>({...v,top:z}))} fsRange={[8,200]}/>
+                      </>}
+                    </Sec>
+
+                    {/* 테두리 */}
+                    <Sec title={
+                      <div onClick={() => setBorderOpen(v => !v)}
+                        style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer",userSelect:"none"}}>
+                        <span>테두리</span>
+                        <span style={{fontSize:10,color:C.dim,fontWeight:400}}>{borderOpen ? "▲" : "▼"}</span>
+                      </div>
+                    }>
+                      {borderOpen && <>
+                        <Row label="색상">
+                          <input type="color" value={border.color} onChange={e=>setBorder(b=>({...b,color:e.target.value}))}
+                            style={{width:36,height:26,cursor:"pointer",flexShrink:0}}/>
+                          <span style={{fontSize:11,color:C.muted,flex:1}}>{border.color}</span>
+                          {bgImg && (
+                            <button onClick={detectBorderColor}
+                              style={{fontSize:10,padding:"3px 8px",background:C.accent,color:"#fff",border:"none",borderRadius:4,cursor:"pointer",flexShrink:0,whiteSpace:"nowrap"}}>
+                              🎨 자동 감지
+                            </button>
+                          )}
+                        </Row>
+                        <Row label="두께">
+                          <Slider min={0} max={15} step={1} value={border.thickness} onChange={v=>setBorder(b=>({...b,thickness:v}))} unit="px"/>
+                        </Row>
+                      </>}
+                    </Sec>
+
+                    {/* 텍스트 */}
+                    <Sec title="텍스트 설정">
+                      <Row label="색상">
+                        <input type="color" value={textColor} onChange={e=>setTextColor(e.target.value)}
+                          style={{width:36,height:26,cursor:"pointer",flexShrink:0}}/>
+                        <span style={{fontSize:11,color:C.muted,flex:1,textAlign:"right"}}>{textColor}</span>
+                      </Row>
+                      <div style={{marginBottom:7}}>
+                        <div style={{fontSize:11,color:C.muted,marginBottom:5}}>폰트 (이 PC에 설치된 폰트)</div>
+                        <FontPicker value={fontFamily} onChange={setFontFamily} systemFonts={systemFonts}/>
+                      </div>
+                    </Sec>
+
+                    {/* 텍스트 영역 */}
+                    <Sec title="텍스트 영역">
+                      <ZoneCard title="소속 (org)"      zone={zones.org}      onChange={z=>setZones(v=>({...v,org:z}))}      fsRange={[8,200]}/>
+                      <ZoneCard title="이름 (name)"     zone={zones.name}     onChange={z=>setZones(v=>({...v,name:z}))}     fsRange={[10,200]}/>
+                      <ZoneCard title="직위 (position)" zone={zones.position} onChange={z=>setZones(v=>({...v,position:z}))} fsRange={[8,200]}/>
+                      <ZoneCard title="추가 1 (field1)" zone={zones.field1}   onChange={z=>setZones(v=>({...v,field1:z}))}   fsRange={[6,200]}/>
+                      <ZoneCard title="추가 2 (field2)" zone={zones.field2}   onChange={z=>setZones(v=>({...v,field2:z}))}   fsRange={[6,200]}/>
+                    </Sec>
+                  </>
                 )}
 
-                <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-                  <button onClick={exportOne} disabled={exporting} style={{padding:"8px 16px",background:exporting?"#444":C.accent,color:exporting?C.dim:"#fff",border:"none",borderRadius:6,fontSize:12,fontWeight:600,cursor:exporting?"not-allowed":"pointer"}}>🖼 PNG 저장</button>
-                  {csvData.length>0&&(
-                    <>
-                    <button onClick={exportPDFDirect} disabled={exporting} style={{padding:"8px 16px",background:exporting?"#444":"#238636",color:exporting?C.dim:"#fff",border:"none",borderRadius:6,fontSize:12,fontWeight:600,cursor:exporting?"not-allowed":"pointer"}}>
-                      {exporting?`생성 중... ${expProg.cur}/${expProg.total}`:`📥 PDF 다운 (${csvData.length}명)`}
-                    </button>
-                    <button onClick={exportImagesZip} disabled={exporting} style={{padding:"8px 16px",background:exporting?"#444":"#8b5cf6",color:exporting?C.dim:"#fff",border:"none",borderRadius:6,fontSize:12,fontWeight:600,cursor:exporting?"not-allowed":"pointer"}}>
-                      📦 이미지 ZIP
-                    </button>
-                    <button onClick={exportPDF} disabled={exporting} style={{padding:"8px 16px",background:exporting?"#444":C.border2,color:exporting?C.dim:C.text,border:"none",borderRadius:6,fontSize:12,fontWeight:600,cursor:exporting?"not-allowed":"pointer"}}>
-                      👁 미리보기
-                    </button>
-                    </>
-                  )}
-                </div>
-
-                {exporting&&(
-                  <div style={{width:300,padding:"10px 14px",background:C.surface,border:`1px solid ${C.border}`,borderRadius:8}}>
-                    <div style={{fontSize:11,color:C.muted,marginBottom:6}}>{expMsg}</div>
-                    <div style={{height:5,background:C.border2,borderRadius:3}}>
-                      <div style={{height:5,background:`linear-gradient(90deg,${C.blue},${C.green})`,borderRadius:3,width:`${(expProg.cur/expProg.total)*100}%`,transition:"width .2s"}}/>
+                {tab === "data" && (
+                  <>
+                    {/* 입력 방식 선택 */}
+                    <div style={{display:"flex",gap:0,marginBottom:12,background:C.bg,borderRadius:6,border:`1px solid ${C.border2}`,overflow:"hidden"}}>
+                      {[{id:"file",label:"📂 파일 업로드"},{id:"manual",label:"✏ 직접 입력"}].map(m => (
+                        <button key={m.id} onClick={() => { setDataMode(m.id); setPidx(0); }}
+                          style={{flex:1,padding:"8px 0",background:dataMode===m.id?C.accent:"transparent",color:dataMode===m.id?"#fff":C.muted,border:"none",fontSize:11,fontWeight:dataMode===m.id?700:400,cursor:"pointer"}}>
+                          {m.label}
+                        </button>
+                      ))}
                     </div>
-                    <div style={{fontSize:10,color:C.dim,marginTop:5,textAlign:"right"}}>{expProg.cur} / {expProg.total}명</div>
-                  </div>
+
+                    {dataMode === "file" && (
+                      <>
+                        <Sec title="데이터 가져오기">
+                          <label style={{display:"flex",alignItems:"center",gap:8,padding:"10px 12px",background:C.bg,border:`1px dashed ${C.border2}`,borderRadius:6,cursor:"pointer",marginBottom:8,userSelect:"none"}}>
+                            <span style={{fontSize:16}}>📂</span>
+                            <div>
+                              <div style={{fontSize:12,color:C.text,fontWeight:600}}>CSV / Excel 업로드</div>
+                              <div style={{fontSize:10,color:C.muted}}>(.csv, .xlsx, .xls)</div>
+                            </div>
+                            <input type="file" accept=".csv,.xlsx,.xls" style={{display:"none"}}
+                              onChange={e => { const f=e.target.files[0]; e.target.value=""; if(f) handleDataUpload(f); }}/>
+                          </label>
+                          <SampleCsvBox/>
+                        </Sec>
+
+                        {csvData.length > 0 && (
+                          <>
+                            <Sec title="컬럼 매핑">
+                              {[
+                                {key:"org",      label:"소속"},
+                                {key:"name",     label:"이름"},
+                                {key:"position", label:"직위"},
+                                {key:"field1",   label:"추가 1"},
+                                {key:"field2",   label:"추가 2"},
+                              ].map(({key,label}) => (
+                                <Row key={key} label={label}>
+                                  <select value={colMap[key]} onChange={e=>setColMap(m=>({...m,[key]:+e.target.value}))}
+                                    style={{...inp,width:"auto",flex:1,padding:"4px 6px",fontSize:11}}>
+                                    <option value={-1}>— 사용 안 함 —</option>
+                                    {headers.map((h,i) => <option key={i} value={i}>{h}</option>)}
+                                  </select>
+                                </Row>
+                              ))}
+                            </Sec>
+
+                            <Sec title="미리보기 탐색">
+                              <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
+                                <button onClick={()=>setPidx(i=>Math.max(0,i-1))} disabled={pidx===0}
+                                  style={{padding:"4px 10px",background:C.bg,border:`1px solid ${C.border2}`,borderRadius:4,color:C.text,cursor:"pointer",fontSize:13,opacity:pidx===0?0.4:1}}>←</button>
+                                <span style={{flex:1,textAlign:"center",fontSize:11,color:C.muted}}>
+                                  {pidx+1} / {csvData.length}명
+                                </span>
+                                <button onClick={()=>setPidx(i=>Math.min(csvData.length-1,i+1))} disabled={pidx===csvData.length-1}
+                                  style={{padding:"4px 10px",background:C.bg,border:`1px solid ${C.border2}`,borderRadius:4,color:C.text,cursor:"pointer",fontSize:13,opacity:pidx===csvData.length-1?0.4:1}}>→</button>
+                              </div>
+                              <div style={{background:"#0a0e14",border:`1px solid ${C.border}`,borderRadius:5,padding:"8px 10px",fontSize:11}}>
+                                {Object.entries(mapRow(csvData[pidx]||[])).filter(([,v])=>v).map(([k,v])=>(
+                                  <div key={k} style={{display:"flex",gap:6,marginBottom:3}}>
+                                    <span style={{color:C.muted,width:40,flexShrink:0}}>{k}</span>
+                                    <span style={{color:C.text}}>{v}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </Sec>
+                          </>
+                        )}
+
+                        {csvData.length === 0 && (
+                          <div style={{textAlign:"center",color:C.muted,fontSize:12,padding:"30px 0",lineHeight:2}}>
+                            CSV 또는 Excel 파일을<br/>업로드해주세요
+                          </div>
+                        )}
+                      </>
+                    )}
+
+                    {dataMode === "manual" && (
+                      <>
+                        <Sec title={editIdx !== null ? "항목 수정" : "항목 추가"}>
+                          {[
+                            {key:"org",      label:"소속",   placeholder:"예) ○○기업"},
+                            {key:"name",     label:"이름*",  placeholder:"예) 홍길동"},
+                            {key:"position", label:"직위",   placeholder:"예) 대표이사"},
+                            {key:"field1",   label:"추가 1", placeholder:""},
+                            {key:"field2",   label:"추가 2", placeholder:""},
+                          ].map(({key,label,placeholder}) => (
+                            <Row key={key} label={label}>
+                              <input value={manualForm[key]}
+                                onChange={e=>setManualForm(f=>({...f,[key]:e.target.value}))}
+                                placeholder={placeholder}
+                                style={{...inp}}/>
+                            </Row>
+                          ))}
+                          <div style={{display:"flex",gap:6,marginTop:4}}>
+                            {editIdx !== null && (
+                              <button onClick={() => { setEditIdx(null); setManualForm({org:"",name:"",position:"",field1:"",field2:""}); }}
+                                style={{flex:1,padding:"7px",background:C.bg,color:C.muted,border:`1px solid ${C.border2}`,borderRadius:5,fontSize:11,cursor:"pointer"}}>
+                                취소
+                              </button>
+                            )}
+                            <button onClick={() => {
+                              if (!manualForm.name.trim()) { alert("이름을 입력해주세요."); return; }
+                              const entry = {
+                                org:      manualForm.org.trim(),
+                                name:     manualForm.name.trim(),
+                                position: manualForm.position.trim(),
+                                field1:   manualForm.field1.trim(),
+                                field2:   manualForm.field2.trim(),
+                              };
+                              if (editIdx !== null) {
+                                setManualData(d => d.map((item,i) => i===editIdx ? entry : item));
+                                setEditIdx(null);
+                              } else {
+                                setPidx(manualData.length);
+                                setManualData(d => [...d, entry]);
+                              }
+                              setManualForm({org:"",name:"",position:"",field1:"",field2:""});
+                            }}
+                              style={{flex:1,padding:"7px",background:C.accent,color:"#fff",border:"none",borderRadius:5,fontSize:11,fontWeight:700,cursor:"pointer"}}>
+                              {editIdx !== null ? "수정 완료" : "+ 추가"}
+                            </button>
+                          </div>
+                        </Sec>
+
+                        {manualData.length > 0 && (
+                          <Sec title={`입력된 항목 (${manualData.length}명)`}>
+                            <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
+                              <button onClick={()=>setPidx(i=>Math.max(0,i-1))} disabled={pidx===0}
+                                style={{padding:"4px 10px",background:C.bg,border:`1px solid ${C.border2}`,borderRadius:4,color:C.text,cursor:"pointer",fontSize:13,opacity:pidx===0?0.4:1}}>←</button>
+                              <span style={{flex:1,textAlign:"center",fontSize:11,color:C.muted}}>
+                                {pidx+1} / {manualData.length}명
+                              </span>
+                              <button onClick={()=>setPidx(i=>Math.min(manualData.length-1,i+1))} disabled={pidx===manualData.length-1}
+                                style={{padding:"4px 10px",background:C.bg,border:`1px solid ${C.border2}`,borderRadius:4,color:C.text,cursor:"pointer",fontSize:13,opacity:pidx===manualData.length-1?0.4:1}}>→</button>
+                            </div>
+                            <div style={{maxHeight:200,overflowY:"auto",marginBottom:6}}>
+                              {manualData.map((entry, i) => (
+                                <div key={i}
+                                  onClick={() => setPidx(i)}
+                                  style={{display:"flex",alignItems:"center",padding:"6px 8px",background:i===pidx?C.accent+"22":C.bg,borderRadius:4,marginBottom:3,cursor:"pointer",border:`1px solid ${i===pidx?C.blue:C.border}`}}>
+                                  <div style={{flex:1,minWidth:0}}>
+                                    <span style={{fontSize:12,color:C.text,fontWeight:700}}>{entry.name}</span>
+                                    {entry.org && <span style={{fontSize:11,color:C.muted,marginLeft:6}}>{entry.org}</span>}
+                                    {entry.position && <span style={{fontSize:10,color:C.dim,marginLeft:6}}>{entry.position}</span>}
+                                  </div>
+                                  <div style={{display:"flex",gap:4,flexShrink:0}}>
+                                    <button onClick={e=>{e.stopPropagation();setEditIdx(i);setManualForm({...entry});setPidx(i);}}
+                                      style={{padding:"2px 7px",background:C.surface,color:C.blue,border:`1px solid ${C.border2}`,borderRadius:3,fontSize:10,cursor:"pointer"}}>수정</button>
+                                    <button onClick={e=>{e.stopPropagation();setManualData(d=>d.filter((_,j)=>j!==i));if(pidx>=manualData.length-1)setPidx(Math.max(0,manualData.length-2));}}
+                                      style={{padding:"2px 7px",background:"#2d1515",color:C.red,border:`1px solid #4a1515`,borderRadius:3,fontSize:10,cursor:"pointer"}}>삭제</button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                            <button onClick={() => { if(window.confirm(`${manualData.length}개 항목을 모두 삭제할까요?`)) { setManualData([]); setPidx(0); setEditIdx(null); } }}
+                              style={{width:"100%",padding:"5px",background:"#2d1515",color:C.red,border:`1px solid #4a1515`,borderRadius:5,fontSize:11,cursor:"pointer"}}>
+                              전체 삭제
+                            </button>
+                          </Sec>
+                        )}
+
+                        {manualData.length === 0 && (
+                          <div style={{textAlign:"center",color:C.muted,fontSize:12,padding:"20px 0",lineHeight:2}}>
+                            위 양식에서 항목을 추가해주세요
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </>
                 )}
               </div>
             </div>
-            </>
-          );
-        }
 
-        ReactDOM.render(<NameTagSystem />, document.getElementById('root'));
-    </script>
+            {/* 메인 미리보기 영역 */}
+            <div ref={mainAreaRef} style={{flex:1,display:"flex",flexDirection:"column",background:C.bg,overflow:"hidden",minWidth:0}}>
+
+              {/* 확대경 슬라이더 */}
+              <div style={{display:"flex",alignItems:"center",gap:8,padding:isMobile?"6px 12px 0":"8px 18px 0",flexShrink:0}}>
+                <span style={{fontSize:12}}>🔍</span>
+                <input type="range" min={0.3} max={isMobile?2.0:3.0} step={0.05} value={previewZoom}
+                  onChange={e => setPreviewZoom(+e.target.value)}
+                  style={{flex:1,maxWidth:isMobile?undefined:200}}/>
+                <span style={{fontSize:10,color:C.blue,fontFamily:"monospace",width:36,textAlign:"right"}}>
+                  {Math.round(effectiveZoom*100)}%
+                </span>
+                <button onClick={() => setPreviewZoom(0.5)}
+                  style={{fontSize:10,color:C.muted,background:"transparent",border:`1px solid ${C.border2}`,borderRadius:4,padding:"2px 6px",cursor:"pointer",flexShrink:0}}>
+                  초기화
+                </button>
+              </div>
+
+              {/* 캔버스 */}
+              <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",overflow:"auto",padding:"12px 20px 8px"}}>
+                <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6}}>
+                  <div style={{
+                    boxShadow:"0 12px 48px rgba(0,0,0,0.55), 0 3px 12px rgba(0,0,0,0.35)",
+                    borderRadius:4, overflow:"hidden", flexShrink:0,
+                  }}>
+                    <canvas ref={canvasRef}
+                      width={dispW} height={dispH}
+                      style={{display:"block"}}/>
+                  </div>
+                  <div style={{fontSize:10,color:C.dim,letterSpacing:"0.04em"}}>
+                    {sz.wMM}×{sz.hMM}mm &nbsp;·&nbsp; {sz.ew}×{sz.eh}px (300dpi 출력)
+                  </div>
+                </div>
+              </div>
+
+              {/* 하단 바: A4 정보 + 액션 버튼 */}
+              <div style={{height:BOTTOM_BAR_H,flexShrink:0,borderTop:`1px solid ${C.border}`,background:C.surface,display:"flex",alignItems:"center",padding:isMobile?"0 10px":"0 18px",gap:isMobile?5:14}}>
+                {/* A4 배치 요약 (모바일에서 숨김) */}
+                {!isMobile && (
+                  <div style={{flex:1,display:"flex",alignItems:"center",gap:10,minWidth:0}}>
+                    {(() => {
+                      const {cols,rows,perPage} = calcLayout(sz);
+                      const pages = effectiveData.length > 0 ? Math.ceil(effectiveData.length/perPage) : null;
+                      return (
+                        <div style={{fontSize:11,color:C.muted,lineHeight:1.5}}>
+                          <span style={{color:C.text,fontWeight:700}}>A4 배치: </span>
+                          {cols}열×{rows}행 · <span style={{color:C.blue}}>{perPage}매/페이지</span>
+                          {pages && <> · <span style={{color:C.green,fontWeight:700}}>{effectiveData.length}명</span> → <span style={{color:C.orange,fontWeight:700}}>{pages}p</span></>}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
+                {isMobile && <div style={{flex:1}}/>}
+
+                {/* 버튼 */}
+                <div style={{display:"flex",gap:isMobile?5:7,flexShrink:0}}>
+                  <button onClick={handleSaveZip} disabled={busy}
+                    style={{padding:isMobile?"6px 11px":"7px 13px",background:busy?"#333":C.purple,color:"#fff",border:"none",borderRadius:6,fontSize:isMobile?10:11,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
+                    📦 ZIP
+                  </button>
+                  <button onClick={handleSavePdf} disabled={busy}
+                    style={{padding:isMobile?"6px 11px":"7px 13px",background:busy?"#333":"#238636",color:"#fff",border:"none",borderRadius:6,fontSize:isMobile?10:11,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
+                    📥 PDF
+                  </button>
+                  <button onClick={handlePreview} disabled={busy}
+                    style={{padding:isMobile?"6px 13px":"7px 16px",background:busy?"#333":C.accent,color:"#fff",border:"none",borderRadius:6,fontSize:isMobile?11:12,fontWeight:700,cursor:"pointer",opacity:busy?0.6:1}}>
+                    {busy ? `${busyMsg}${prog.total>0?` (${prog.cur}/${prog.total})`:""}` : "🖨 인쇄 준비"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* 인쇄 모달 */}
+          <PrintModal
+            html={printHtml}
+            onClose={() => { if (!busy) setPrintHtml(null); }}
+            onPrint={handlePrint}
+            onSavePdf={handleSavePdf}
+            onSaveZip={handleSaveZip}
+            busy={busy}
+            msg={busyMsg}
+            prog={prog}
+          />
+        </div>
+      );
+    }
+
+    ReactDOM.render(<LanyardTagSystem />, document.getElementById('root'));
+  </script>
 </body>
 </html>
